@@ -1406,6 +1406,36 @@ describe("subagent discovery", () => {
     }
   });
 
+  it("collectSubagentExtensionPaths does not double-load spawning extension for worker allowlist", () => {
+    const worker = testApi.loadAgentDefaults("worker");
+    assert.ok(worker, "expected bundled worker to be discoverable");
+    const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
+    assert.ok(allowlist, "expected an allowlist");
+
+    const paths = testApi.collectSubagentExtensionPaths({
+      agent: "worker",
+      toolAllowlist: allowlist,
+      model: "cursor/composer-2.5:slow",
+      thinking: "off",
+      systemPromptMode: null,
+      identity: null,
+      spawnable: worker.subagentAgents ?? null,
+      autoExit: true,
+      cwd: null,
+      agentDir: null,
+    });
+
+    const spawnExt = testApi.getSpawningExtensionPath();
+    const vendorSelf = testApi.getToolExtensionPath("subagent");
+    const interactivePaths = [...paths].filter(
+      (p) => p.includes("pi-interactive-subagents") || p === vendorSelf,
+    );
+    if (spawnExt) {
+      assert.equal(interactivePaths.length, 1, "expected exactly one pi-interactive-subagents -e path");
+      assert.equal(interactivePaths[0], spawnExt, "expected curated loader, not vendor self-path");
+    }
+  });
+
   it("applySandboxToParts omits restriction flags when the loadout was unrestricted", () => {
     withTempDir((d) => {
       const parts: string[] = [];

@@ -882,9 +882,13 @@ function collectSubagentExtensionPaths(loadout: SubagentLoadout): Set<string> {
   }
 
   if (loadout.toolAllowlist) {
+    const spawnable = loadout.spawnable && loadout.spawnable.length > 0;
     for (const tool of loadout.toolAllowlist.split(",")) {
       const trimmed = tool.trim();
       if (!trimmed) continue;
+      // Spawning tools map to this extension's vendor entrypoint; when spawnable
+      // is set, getSpawningExtensionPath loads the curated loader instead.
+      if (spawnable && (SPAWNING_TOOLS as readonly string[]).includes(trimmed)) continue;
       const extPath = getToolExtensionPath(trimmed);
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
     }
