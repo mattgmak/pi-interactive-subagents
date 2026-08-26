@@ -1217,8 +1217,12 @@ describe("subagent discovery", () => {
       );
     }
     assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
-    // Spawning tools are registered by this extension itself.
-    assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+    const subagentPath = testApi.getToolExtensionPath("subagent");
+    assert.ok(subagentPath?.endsWith("index.ts"));
+    const spawnLoader = testApi.getSpawningExtensionPath();
+    if (spawnLoader) {
+      assert.equal(subagentPath, spawnLoader, "spawning tools should resolve to curated loader");
+    }
   });
 
   it("ignores invalid session-mode values", async () => {

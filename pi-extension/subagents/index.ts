@@ -211,9 +211,10 @@ export function registerToolExtension(name: string, extensionPath: string): void
  */
 function getToolExtensionPath(tool: string): string | undefined {
   if (BUILTIN_TOOLS.has(tool)) return undefined;
-  // The four spawning tools are registered by THIS extension.
+  // Spawning tools live in the pi-interactive-subagents loader (not this vendor entrypoint).
   if ((SPAWNING_TOOLS as readonly string[]).includes(tool)) {
-    return fileURLToPath(import.meta.url);
+    const loaderPath = join(getAgentConfigDir(), "extensions", "pi-interactive-subagents", "index.ts");
+    return existsSync(loaderPath) ? loaderPath : fileURLToPath(import.meta.url);
   }
   const extBase = join(getAgentConfigDir(), "extensions");
   const map: Record<string, string> = {
