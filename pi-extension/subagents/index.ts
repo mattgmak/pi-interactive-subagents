@@ -832,13 +832,84 @@ function buildSubagentToolAllowlist(
  * PI_SUBAGENT_ALLOWED / PI_CODING_AGENT_DIR) and cwd are the caller's
  * responsibility since they differ slightly between launch and resume.
  */
+function formatSandboxModel(model: string, thinking: string | null | undefined): string {
+  if (!thinking || thinking === "off") return model;
+  return `${model}:${thinking}`;
+}
+
+/** Provider extensions (e.g. cursor) are not tool-backed; load explicitly for --no-extensions children. */
+function getProviderExtensionPath(model: string): string | undefined {
+  const provider = model.split("/")[0];
+  if (provider !== "cursor") return undefined;
+  const extPath = join(getAgentConfigDir(), "extensions", "pi-cursor-sdk", "index.ts");
+  return existsSync(extPath) ? extPath : undefined;
+}
+
+/**
+ * Curated extension loaders passed into every restricted subagent sandbox
+ * (`--no-extensions` + explicit `-e`). Keeps child stack aligned with the
+ * orchestrator (lean-ctx, permissions, providers, web tools) without leaking
+ * parent-only extensions (engram, agent-sesh, mcp-nixos, …).
+ */
+const SUBAGENT_BASE_EXTENSIONS = [
+  "pi-lean-ctx",
+  "pi-permission-system",
+  "pi-cursor-sdk",
+  "pi-web-access",
+  "pi-powerline-footer",
+  "pi-caveman",
+  "pi-codegraph",
+] as const;
+
+/** Resolve a pi loader dir under PI_CODING_AGENT_DIR/extensions/<name>/index.ts. */
+function getCuratedExtensionPath(loaderName: string): string | undefined {
+  const extPath = join(getAgentConfigDir(), "extensions", loaderName, "index.ts");
+  return existsSync(extPath) ? extPath : undefined;
+}
+
+/** Spawning toolset lives in the pi-interactive-subagents loader (not subagent-done). */
+function getSpawningExtensionPath(): string | undefined {
+  return getCuratedExtensionPath("pi-interactive-subagents");
+}
+
+/** All `-e` extension paths for a restricted subagent loadout. */
+function collectSubagentExtensionPaths(loadout: SubagentLoadout): Set<string> {
+  const extPaths = new Set<string>();
+
+  for (const loaderName of SUBAGENT_BASE_EXTENSIONS) {
+    const extPath = getCuratedExtensionPath(loaderName);
+    if (extPath) extPaths.add(extPath);
+  }
+
+  if (loadout.toolAllowlist) {
+    for (const tool of loadout.toolAllowlist.split(",")) {
+      const trimmed = tool.trim();
+      if (!trimmed) continue;
+      const extPath = getToolExtensionPath(trimmed);
+      if (extPath && existsSync(extPath)) extPaths.add(extPath);
+    }
+  }
+
+  if (loadout.spawnable && loadout.spawnable.length > 0) {
+    const spawnExt = getSpawningExtensionPath();
+    if (spawnExt) extPaths.add(spawnExt);
+  }
+
+  if (loadout.model) {
+    const providerExtPath = getProviderExtensionPath(loadout.model);
+    if (providerExtPath) extPaths.add(providerExtPath);
+  }
+
+  return extPaths;
+}
+
 function applySandboxToParts(
   parts: string[],
   loadout: SubagentLoadout,
   opts: { artifactDir: string; name: string },
 ): void {
   if (loadout.model) {
-    const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
+    const model = formatSandboxModel(loadout.model, loadout.thinking);
     parts.push("--model", shellEscape(model));
   }
 
@@ -864,12 +935,7 @@ function applySandboxToParts(
     parts.push("--no-extensions");
     parts.push("--tools", shellEscape(loadout.toolAllowlist));
 
-    const extPaths = new Set<string>();
-    for (const tool of loadout.toolAllowlist.split(",")) {
-      const extPath = getToolExtensionPath(tool);
-      if (extPath && existsSync(extPath)) extPaths.add(extPath);
-    }
-    for (const extPath of extPaths) {
+    for (const extPath of collectSubagentExtensionPaths(loadout)) {
       parts.push("-e", shellEscape(extPath));
     }
   }
@@ -1129,6 +1195,12 @@ export const __test__ = {
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
+  formatSandboxModel,
+  getProviderExtensionPath,
+  SUBAGENT_BASE_EXTENSIONS,
+  getCuratedExtensionPath,
+  getSpawningExtensionPath,
+  collectSubagentExtensionPaths,
   applySandboxToParts,
   buildPiPromptArgs,
   formatWidgetRightLabel,

@@ -1195,7 +1195,7 @@ describe("subagent discovery", () => {
     for (const t of ["subagent", "subagent_message", "subagents_list"]) {
       assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
     }
-    assert.ok(tools.has("bash"), "expected worker to keep bash");
+    assert.ok(tools.has("ctx_shell"), "expected worker to keep ctx_shell");
   });
 
   it("scout and researcher are not granted spawning tools", () => {
@@ -1209,7 +1209,13 @@ describe("subagent discovery", () => {
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
+    const webSearchPath = testApi.getToolExtensionPath("web_search");
+    if (webSearchPath) {
+      assert.ok(
+        webSearchPath.endsWith("web-search/index.ts") || webSearchPath.endsWith("pi-web-access/index.ts"),
+        `unexpected web_search extension path: ${webSearchPath}`,
+      );
+    }
     assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
     // Spawning tools are registered by this extension itself.
     assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
@@ -1319,6 +1325,85 @@ describe("subagent discovery", () => {
         "expected the tool allowlist as the --tools value",
       );
     });
+  });
+
+  it("formatSandboxModel omits thinking suffix when thinking is off", () => {
+    assert.equal(
+      testApi.formatSandboxModel("cursor/composer-2.5:slow", "off"),
+      "cursor/composer-2.5:slow",
+    );
+    assert.equal(testApi.formatSandboxModel("openrouter/z-ai/glm-5.2", "medium"), "openrouter/z-ai/glm-5.2:medium");
+    assert.equal(testApi.formatSandboxModel("openrouter/z-ai/glm-5.2", null), "openrouter/z-ai/glm-5.2");
+  });
+
+  it("applySandboxToParts loads cursor provider extension for cursor models under --no-extensions", () => {
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: "scout",
+          toolAllowlist: "read,grep,find,ls,ask_question",
+          model: "cursor/composer-2.5:slow",
+          thinking: "off",
+          systemPromptMode: "append",
+          identity: "You are a scout.",
+          spawnable: null,
+          autoExit: true,
+          cwd: null,
+          agentDir: null,
+        },
+        { artifactDir: d, name: "scout" },
+      );
+      const joined = parts.join(" ");
+      assert.ok(joined.includes("cursor/composer-2.5:slow"), "expected bare model without :off suffix");
+      assert.ok(!joined.includes("composer-2.5:slow:off"), "must not append :off to model id");
+      const providerPath = testApi.getProviderExtensionPath("cursor/composer-2.5:slow");
+      if (providerPath) {
+        assert.ok(joined.includes("pi-cursor-sdk"), "expected pi-cursor-sdk extension when installed");
+      }
+    });
+  });
+
+  it("collectSubagentExtensionPaths includes curated base loaders when installed", () => {
+    const paths = testApi.collectSubagentExtensionPaths({
+      agent: "scout",
+      toolAllowlist: "ctx_read,ctx_grep",
+      model: "cursor/composer-2.5:slow",
+      thinking: "off",
+      systemPromptMode: null,
+      identity: null,
+      spawnable: null,
+      autoExit: true,
+      cwd: null,
+      agentDir: null,
+    });
+    const joined = [...paths].join(" ");
+    for (const loader of testApi.SUBAGENT_BASE_EXTENSIONS) {
+      const extPath = testApi.getCuratedExtensionPath(loader);
+      if (extPath) {
+        assert.ok(joined.includes(loader), `expected curated loader ${loader} when present on disk`);
+      }
+    }
+  });
+
+  it("collectSubagentExtensionPaths adds spawning loader when spawnable is set", () => {
+    const paths = testApi.collectSubagentExtensionPaths({
+      agent: "worker",
+      toolAllowlist: "read,bash",
+      model: null,
+      thinking: null,
+      systemPromptMode: null,
+      identity: null,
+      spawnable: ["scout", "researcher"],
+      autoExit: true,
+      cwd: null,
+      agentDir: null,
+    });
+    const spawnExt = testApi.getSpawningExtensionPath();
+    if (spawnExt) {
+      assert.ok([...paths].includes(spawnExt), "expected pi-interactive-subagents loader for spawnable agents");
+    }
   });
 
   it("applySandboxToParts omits restriction flags when the loadout was unrestricted", () => {

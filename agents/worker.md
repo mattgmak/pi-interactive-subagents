@@ -1,7 +1,7 @@
 ---
 name: worker
 description: General-purpose worker — reads, writes, and edits code
-tools: read, write, edit, bash, web_search, web_fetch
+tools: ctx_read, write, edit, ctx_shell, web_search, fetch_content
 subagent_agents: scout, researcher
 model: openrouter/z-ai/glm-5.3
 thinking: high
