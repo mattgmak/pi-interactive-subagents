@@ -17,14 +17,48 @@ import { homedir } from "node:os";
 import {
   isMuxAvailable,
   muxSetupHint,
-  createSurface,
+  launchSurface,
   sendCommand,
-  sendLongCommand,
   pollForExit,
   closeSurface,
   shellEscape,
   readScreen,
+  writeLaunchScript,
 } from "./tmux.ts";
+
+// Activate the worktree's direnv/devenv environment inside the launch script
+// (bash syntax — the script runs under bash even when the pane shell is nu).
+// Silent no-op when direnv is absent or the cwd has no .envrc.
+const DIRENV_BOOTSTRAP = 'eval "$(direnv export bash 2>/dev/null)"; ';
+
+// Auth/config env vars the parent pi was started with that child panes would
+// otherwise never see: command-form panes start from the tmux server env, not
+// the parent's env, and tmux -e only mirrors the pane's *recorded* env (vars
+// exported post-init by the user's shell are missing). Forwarding these in the
+// inline env prefix is the only reliable channel — children authenticate with
+// the same providers as the parent. The parent's own process.env is the
+// ground truth for what the parent can actually use.
+const FORWARDED_ENV_VARS = [
+  "CLINE_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_BASE_URL",
+  "CURSOR_API_KEY",
+  "OPENCODE_API_KEY",
+  "GEMINI_API_KEY",
+  "XAI_API_KEY",
+  "MISTRAL_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "OLLAMA_HOST",
+] as const;
+
+function pushForwardedEnv(envParts: string[]): void {
+  for (const k of FORWARDED_ENV_VARS) {
+    const v = process.env[k];
+    if (v) envParts.push(`${k}=${shellEscape(v)}`);
+  }
+}
 
 import {
   countSessionEntryLines,
@@ -492,16 +526,29 @@ function widgetIcon(kind: StatusSnapshot["kind"]): string {
 }
 
 /**
- * Wait long enough for a freshly created pane to finish shell startup.
- *
- * Some environments do extra shell-init work before the prompt is ready
- * (for example direnv/devenv), so the delay is configurable for users who hit
- * dropped commands. Keep the historical default at 500ms.
+ * Historical fixed shell-started delay, kept as an env-documented fallback
+ * constant for compatibility. NO LONGER the active mechanism: launch waits on
+ * real readiness via waitForShellReady (tmux.ts), which polls the pane's shell
+ * until direnv/devenv activation finished — a fixed sleep lets those commands
+ * eat typed input. See getShellReadyTimeoutMs.
  */
 function getShellReadyDelayMs(): number {
   const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
+}
+
+/**
+ * Upper bound for waitForShellReady: how long a fresh pane may take to finish
+ * shell init (direnv/devenv activation) before launch proceeds anyway.
+ * Override with PI_SUBAGENT_SHELL_READY_TIMEOUT_MS. Default 120s. Even when
+ * this timeout is hit, the launch is protected by sendCommand's input flush
+ * and pollForExit's eaten-launch detection.
+ */
+function getShellReadyTimeoutMs(): number {
+  const raw = process.env.PI_SUBAGENT_SHELL_READY_TIMEOUT_MS?.trim();
+  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120_000;
 }
 
 function muxUnavailableResult() {
@@ -1194,6 +1241,7 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
+  getShellReadyTimeoutMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
@@ -1279,13 +1327,11 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
+  // Pre-created surface (parallel mode) is used as-is; a new surface is
+  // created by each launch branch AFTER its launch script is written, using
+  // command form (`tmux split-window 'bash <script>'` as the pane program),
+  // so the script runs through /bin/sh — no typed input, no shell-init race.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
@@ -1349,7 +1395,8 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command =
+      `${cdPrefix}${DIRENV_BOOTSTRAP}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1359,14 +1406,20 @@ async function launchSubagent(
       .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-    sendLongCommand(surface, command, {
+    const scriptPath = writeLaunchScript(command, {
       scriptPath: launchScriptFile,
       scriptPreamble: [
         `# Claude Code subagent launch script for ${params.name}`,
         `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
       ].join("\n"),
     });
+    const surface =
+      options?.surface ?? launchSurface(params.name, scriptPath, effectiveCwd ?? undefined);
+    if (surfacePreCreated) {
+      // Parallel-mode surface already exists: drive it by typing (flush is
+      // safe — sendCommand only clears when the pane runs an interactive shell).
+      sendCommand(surface, `bash ${shellEscape(scriptPath)}`, true);
+    }
 
     const running: RunningSubagent = {
       id,
@@ -1454,7 +1507,7 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-  envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
+  pushForwardedEnv(envParts);
   const envPrefix = envParts.join(" ") + " ";
 
   // Pass task and skill prompts to the sub-agent.
@@ -1491,7 +1544,7 @@ async function launchSubagent(
   // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
-  const piCommand = cdPrefix + envPrefix + parts.join(" ");
+  const piCommand = cdPrefix + DIRENV_BOOTSTRAP + envPrefix + parts.join(" ");
   const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
@@ -1500,15 +1553,18 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, {
+  const scriptPath = writeLaunchScript(command, {
     scriptPath: launchScriptFile,
     scriptPreamble: [
       `# Subagent launch script for ${params.name}`,
       `# Generated: ${new Date().toISOString()}`,
       `# Session: ${subagentSessionFile}`,
-      `# Surface: ${surface}`,
     ].join("\n"),
   });
+  const surface = options?.surface ?? launchSurface(params.name, scriptPath, effectiveCwd ?? undefined);
+  if (surfacePreCreated) {
+    sendCommand(surface, `bash ${shellEscape(scriptPath)}`, true);
+  }
 
   const running: RunningSubagent = {
     id,
@@ -1629,9 +1685,13 @@ async function watchSubagent(
       }
 
       if (!summary) {
-        summary = readScreen(surface, 200)
-          .replace(/__SUBAGENT_DONE_\d+__/, "")
-          .trimEnd();
+        try {
+          summary = readScreen(surface, 200)
+            .replace(/__SUBAGENT_DONE_\d+__/, "")
+            .trimEnd();
+        } catch {
+          // Pane may have been killed by pollForExit (eaten-launch detection).
+        }
       }
 
       if (!summary) {
@@ -1648,10 +1708,18 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      // Leave the pane open on "timeout" — it may hold a still-running session
+      // the user should inspect. "eaten" already killed the pane itself.
+      if (result.reason !== "timeout") {
+        try {
+          closeSurface(surface);
+        } catch {
+          // Pane may already be gone (eaten-launch detection killed it).
+        }
+      }
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}), ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}) };
     }
 
     // Pi subagent result extraction
@@ -1676,7 +1744,15 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
+    // Leave the pane open on "timeout" — it may hold a still-running session
+    // the user should inspect. "eaten" already killed the pane itself.
+    if (result.reason !== "timeout") {
+      try {
+        closeSurface(surface);
+      } catch {
+        // Pane may already be gone (eaten-launch detection killed it).
+      }
+    }
     runningSubagents.delete(running.id);
 
     return {
@@ -2227,8 +2303,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
-        const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        // Surface is created below, after the resume script is written —
+        // command-form spawn (`bash <script>` as pane program), no typed
+        // input, no shell-init race.
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(sessionPath)];
@@ -2281,6 +2358,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+        pushForwardedEnv(resumeEnvParts);
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
         }
@@ -2290,7 +2368,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command =
+          `${resumeCdPrefix}${DIRENV_BOOTSTRAP}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2301,16 +2380,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        sendLongCommand(surface, command, {
+        const scriptPath = writeLaunchScript(command, {
           scriptPath: launchScriptFile,
           scriptPreamble: [
             `# Subagent resume script for ${name}`,
             `# Generated: ${new Date().toISOString()}`,
             `# Session: ${sessionPath}`,
-            `# Surface: ${surface}`,
             ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
           ].join("\n"),
         });
+        const surface = launchSurface(name, scriptPath, loadout.cwd ?? undefined);
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {

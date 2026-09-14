@@ -126,11 +126,12 @@ export function createSurfaceSplit(
   name: string,
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
+  opts?: { command?: string; cwd?: string },
 ): string {
   void name;
   requireTmux();
 
-  const args = ["split-window", "-d"];
+  const args = ["split-window", "-d", "-e"];
   if (direction === "left" || direction === "right") {
     args.push("-h");
   } else {
@@ -142,7 +143,13 @@ export function createSurfaceSplit(
   if (fromSurface) {
     args.push("-t", fromSurface);
   }
+  if (opts?.cwd) {
+    args.push("-c", opts.cwd);
+  }
   args.push("-P", "-F", "#{pane_id}");
+  if (opts?.command) {
+    args.push(opts.command);
+  }
 
   const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
   if (!pane.startsWith("%")) {
@@ -154,12 +161,125 @@ export function createSurfaceSplit(
 }
 
 /**
+ * Launch a subagent pane in command form: the pane program is
+ * `bash <script>` run directly by tmux via /bin/sh — no typed keystrokes, no
+ * interactive-shell init, no direnv/devenv readiness race. The script itself
+ * ends with `exec ${SHELL:-bash}` (see writeLaunchScript), handing the pane
+ * back to the user's interactive shell once the subagent exits.
+ *
+ * Returns the new pane id (e.g. `%12`).
+ */
+export function launchSurface(name: string, scriptPath: string, cwd?: string): string {
+  return createSurfaceSplit(name, "right", process.env.TMUX_PANE, {
+    cwd,
+    command: `bash ${shellEscape(scriptPath)}`,
+  });
+}
+
+// ── Shell readiness ──
+
+/**
+ * Interactive shells this extension treats as "safe to type into at a prompt".
+ * A pane whose current command is one of these and which has no children is
+ * considered idle: its shell is reading input, so typed commands will not be
+ * eaten by shell init (direnv/devenv `eval "$(direnv export bash)"`, builds).
+ *
+ * Deliberately excludes node/pi/tmux: flushing input into a live pi session
+ * during steer or resume would interrupt it.
+ */
+const INTERACTIVE_SHELLS = new Set(["bash", "zsh", "nu", "fish", "sh"]);
+
+/**
+ * True when the pane's shell is idle at an interactive prompt: the current
+ * command is an interactive shell, the pane is alive, and the shell has no
+ * child processes. During direnv/devenv activation the shell runs children
+ * (`eval "$(direnv export bash)"`, builds), so this stays false until init has
+ * actually finished — which is exactly the readiness signal launch waits for.
+ */
+async function paneIsIdleShell(surface: string): Promise<boolean> {
+  let cmd = "";
+  let pid = "";
+  let dead = "1";
+  try {
+    const { stdout } = await execFileAsync(
+      "tmux",
+      ["display-message", "-p", "-t", surface, "#{pane_current_command} #{pane_pid} #{pane_dead}"],
+      { encoding: "utf8" },
+    );
+    [cmd, pid, dead] = stdout.trim().split(/\s+/);
+  } catch {
+    return false; // pane unreachable — not an idle shell
+  }
+  if (!INTERACTIVE_SHELLS.has(cmd) || dead !== "0") return false;
+  if (!pid || pid === "0") return true; // no pid to inspect — assume idle
+  try {
+    await execFileAsync("pgrep", ["-P", pid]);
+    return false; // shell has children → busy (direnv/devenv eval, running job)
+  } catch {
+    return true; // no children → idle at prompt
+  }
+}
+
+/**
+ * True when the pane's current command is an interactive shell. This is the
+ * safety gate for input flushing: it allows C-c/C-u only into a shell, never
+ * into a pane currently running node/pi/tmux (which would interrupt a live
+ * subagent session). Sync — sendCommand flushes inline.
+ */
+function paneIsShellSync(surface: string): boolean {
+  try {
+    const cmd = execFileSync(
+      "tmux",
+      ["display-message", "-p", "-t", surface, "#{pane_current_command}"],
+      { encoding: "utf8" },
+    ).trim();
+    return INTERACTIVE_SHELLS.has(cmd);
+  } catch {
+    return false;
+  }
+}
+
+const SHELL_READY_POLL_MS = 100;
+
+/**
+ * Wait until a freshly created pane's shell is genuinely ready to accept
+ * typed input, instead of sleeping a fixed delay.
+ *
+ * Replaces the historical fixed `PI_SUBAGENT_SHELL_READY_DELAY_MS` sleep:
+ * a pane whose shell is still running direnv/devenv activation has children,
+ * so commands typed during that window get eaten. Polls pane_current_command /
+ * pane_pid / pane_dead until the shell is idle at a prompt.
+ *
+ * Best-effort: resolves immediately when the shell is ready, and resolves
+ * anyway once `timeoutMs` passes (the flush guard and eaten-launch detection
+ * in sendCommand/pollForExit cover the overflow case). Never throws on timeout.
+ */
+export async function waitForShellReady(surface: string, timeoutMs: number): Promise<void> {
+  requireTmux();
+  const start = Date.now();
+  for (;;) {
+    if (await paneIsIdleShell(surface)) return;
+    if (Date.now() - start >= timeoutMs) return; // best-effort
+    await new Promise<void>((resolve) => setTimeout(resolve, SHELL_READY_POLL_MS));
+  }
+}
+
+/**
  * Send a command string to a pane and execute it.
  * Typed literally (`-l`) so special characters are not interpreted as keys,
  * then submitted with Enter.
+ *
+ * `flush` clears any stale typed input (C-c to cancel, C-u to clear the
+ * line) before typing the command. SAFETY: the clears are only sent when the
+ * pane's current command is an interactive shell — never into a pane running
+ * node/pi/tmux, which would interrupt a live pi session during steer/resume.
  */
-export function sendCommand(surface: string, command: string): void {
+export function sendCommand(surface: string, command: string, flush = false): void {
   requireTmux();
+  if (flush && paneIsShellSync(surface)) {
+    execFileSync("tmux", ["send-keys", "-t", surface, "C-c"], { encoding: "utf8" });
+    execFileSync("tmux", ["send-keys", "-t", surface, "C-u"], { encoding: "utf8" });
+  }
   execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
   execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
 }
@@ -175,8 +295,17 @@ export function sendCommand(surface: string, command: string): void {
  *
  * Returns the script path.
  */
-export function sendLongCommand(
-  surface: string,
+/**
+ * Write a launch/resume script to disk and return its path.
+ *
+ * The script prints a proven-launch sentinel first: pollForExit scrapes for it
+ * to distinguish "launch ran and printed" from "launch was eaten before the
+ * script even started". The script ends with `exec ${SHELL:-bash}` so a pane
+ * started in command form (`bash <script>` as the pane program) returns to the
+ * user's interactive shell after the subagent exits — $SHELL expands inside
+ * bash (the script), defaulting to plain bash when tmux's env lacks it.
+ */
+export function writeLaunchScript(
   command: string,
   options?: { scriptPath?: string; scriptPreamble?: string },
 ): string {
@@ -189,16 +318,34 @@ export function sendLongCommand(
     );
   mkdirSync(dirname(scriptPath), { recursive: true });
 
-  const scriptParts = ["#!/bin/bash"];
+  const scriptParts = ["#!/bin/bash", "echo '__SUBAGENT_START__'"];
   if (options?.scriptPreamble) {
     scriptParts.push(options.scriptPreamble.trimEnd());
   }
   scriptParts.push(command);
+  scriptParts.push("exec ${SHELL:-bash}");
 
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
     mode: 0o755,
   });
-  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+  return scriptPath;
+}
+
+/**
+ * Send a long command to a pane by writing it to a script file first, then
+ * typing `bash <script>` into the surface. Used for pre-created surfaces
+ * (parallel mode) where the pane already exists and must be driven by typing.
+ * New surfaces use command form via launchSurface + writeLaunchScript instead.
+ *
+ * Returns the script path.
+ */
+export function sendLongCommand(
+  surface: string,
+  command: string,
+  options?: { scriptPath?: string; scriptPreamble?: string; flush?: boolean },
+): string {
+  const scriptPath = writeLaunchScript(command, options);
+  sendCommand(surface, `bash ${shellEscape(scriptPath)}`, options?.flush ?? false);
   return scriptPath;
 }
 
@@ -240,12 +387,46 @@ export function closeSurface(surface: string): void {
 
 // ── Exit polling ──
 
+/** Sentinel printed after the subagent command finishes: `__SUBAGENT_DONE_<code>__`. */
+const DONE_SENTINEL_RE = /__SUBAGENT_DONE_(\d+)__/;
+/** Proven-launch sentinel printed as the first line of the launch script. */
+const START_SENTINEL_RE = /__SUBAGENT_START__/;
+/**
+ * Window in which an eaten launch is detected: the start sentinel must appear
+ * within this many ms of polling, or — if the pane is just sitting at an idle
+ * shell prompt — the launch is declared eaten and the pane is killed.
+ */
+const EATEN_LAUNCH_DETECTION_MS = 30_000;
+/**
+ * Grace period before eaten-launch detection kicks in, so the type→exec race
+ * (command just typed, shell not yet running it) is never misread as eaten.
+ */
+const EATEN_LAUNCH_GRACE_MS = 2_500;
+
+/**
+ * Overall bound on pollForExit. Override with PI_SUBAGENT_EXIT_TIMEOUT_MS
+ * (default 30 minutes). Read in tmux.ts so the whole poll loop — including
+ * the eaten-launch detection — is bounded in one place.
+ */
+function getExitTimeoutMs(): number {
+  const raw = process.env.PI_SUBAGENT_EXIT_TIMEOUT_MS?.trim();
+  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30 * 60 * 1000;
+}
+
 export interface PollResult {
   /** How the subagent exited */
-  reason: "done" | "sentinel" | "error";
-  /** Shell exit code (from sentinel). 0 for file-based exits. */
+  reason: "done" | "sentinel" | "error" | "timeout" | "eaten";
+  /**
+   * Shell exit code (from sentinel). 0 for file-based exits. 1 for
+   * timed-out / eaten-launch failures (see errorMessage).
+   */
   exitCode: number;
-  /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
+  /**
+   * Error message for failure reasons: "error" (auto-retry exhausted,
+   * provider overload, …), "timeout" (PI_SUBAGENT_EXIT_TIMEOUT_MS reached),
+   * "eaten" (launch swallowed by shell init — pane killed).
+   */
   errorMessage?: string;
 }
 
@@ -287,6 +468,8 @@ export async function pollForExit(
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  const exitTimeoutMs = getExitTimeoutMs();
+  let seenStart = false;
 
   for (;;) {
     if (signal.aborted) {
@@ -314,12 +497,41 @@ export async function pollForExit(
       } catch {}
     }
 
-    // Slow path: read terminal screen for sentinel (crash detection)
+    const elapsed = Date.now() - start;
+
+    // Bound the whole loop: never poll forever. Default 30 min
+    // (PI_SUBAGENT_EXIT_TIMEOUT_MS). Prior behavior hung indefinitely when the
+    // DONE sentinel was eaten by shell init — that case is now caught by the
+    // eaten-launch detection below, and this is the last-resort bound. The pane
+    // is deliberately NOT killed here: it may hold a still-running pi session
+    // the user can inspect or resume (watchSubagent skips closing on timeout).
+    if (elapsed >= exitTimeoutMs) {
+      console.error(
+        `[pi-subagents] subagent on surface ${surface} did not exit within ` +
+          `${Math.round(exitTimeoutMs / 1000)}s (PI_SUBAGENT_EXIT_TIMEOUT_MS); abandoning watch.`,
+      );
+      return {
+        reason: "timeout",
+        exitCode: 1,
+        errorMessage:
+          `Subagent did not exit within ${Math.round(exitTimeoutMs / 1000)}s ` +
+          `(PI_SUBAGENT_EXIT_TIMEOUT_MS). Its pane was left open — inspect it directly; ` +
+          `if the process is stuck, kill the pane, then resume with subagent_message ` +
+          `or spawn a fresh subagent.`,
+      };
+    }
+
+    // Slow path: read terminal screen for sentinels (crash detection +
+    // proven-launch detection). DONE marks a finished subagent; START marks
+    // that the launch script actually ran.
     try {
       const screen = await readScreenAsync(surface, 5);
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
+      const match = screen.match(DONE_SENTINEL_RE);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
+      }
+      if (START_SENTINEL_RE.test(screen)) {
+        seenStart = true;
       }
     } catch {
       // Surface may have been destroyed — check if .exit file appeared in the meantime
@@ -335,8 +547,35 @@ export async function pollForExit(
       }
     }
 
-    const elapsed = Math.floor((Date.now() - start) / 1000);
-    options.onTick?.(elapsed);
+    // Eaten-launch detection: within the first ~30s, if the start sentinel
+    // never appeared and the pane is just sitting at an idle interactive shell
+    // prompt (no children), the typed launch line was swallowed by shell init
+    // (direnv/devenv eval running when the command was typed) and never ran.
+    // Kill the pane and report a visible error instead of hanging forever
+    // waiting for a DONE sentinel that will never print.
+    if (!seenStart && elapsed >= EATEN_LAUNCH_GRACE_MS && elapsed < EATEN_LAUNCH_DETECTION_MS) {
+      if (await paneIsIdleShell(surface)) {
+        console.error(
+          `[pi-subagents] launch of subagent on surface ${surface} was eaten by shell ` +
+            `init (no __SUBAGENT_START__ seen and pane idle at shell prompt); killing pane.`,
+        );
+        try {
+          execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+        } catch {
+          // Pane may already be gone; ignore.
+        }
+        return {
+          reason: "eaten",
+          exitCode: 1,
+          errorMessage:
+            `Subagent launch was eaten by shell initialization (direnv/devenv still starting ` +
+            `when the command was typed), so it never ran. The pane was killed; ` +
+            `spawn a fresh subagent.`,
+        };
+      }
+    }
+
+    options.onTick?.(Math.floor(elapsed / 1000));
 
     await new Promise<void>((resolve, reject) => {
       if (signal.aborted) return reject(new Error("Aborted"));
