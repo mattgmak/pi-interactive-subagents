@@ -856,6 +856,7 @@ const SUBAGENT_BASE_EXTENSIONS = [
   "pi-lean-ctx",
   "pi-permission-system",
   "pi-cursor-sdk",
+  "pi-clinepass-provider",
   "pi-web-access",
   "pi-powerline-footer",
   "pi-caveman",
