@@ -131,8 +131,15 @@ export default function (pi: ExtensionAPI) {
       (_tui: any, theme: any) => {
         const box = new Box(1, 0, (text: string) => theme.bg("toolSuccessBg", text));
 
-        const label = subagentAgent || subagentName;
-        const agentTag = label ? theme.bold(theme.fg("accent", `[${label}]`)) : "";
+        // Show the cosmetic name (PI_SUBAGENT_NAME) prominently, with the agent
+        // role (PI_SUBAGENT_AGENT) as a tag when it differs — mirror of the
+        // parent's widget line (`name (agent)`). Collapses to whichever is set
+        // when only one exists, and never duplicates `name (same-name)`.
+        const label =
+          subagentAgent && subagentAgent !== subagentName
+            ? `${subagentName} (${subagentAgent})`
+            : subagentAgent || subagentName;
+        const agentTag = label ? theme.bold(theme.fg("accent", label)) : "";
 
         if (expanded) {
           // Expanded: full tool list + denied
