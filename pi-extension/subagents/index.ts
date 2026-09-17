@@ -50,6 +50,7 @@ const FORWARDED_ENV_VARS = [
   "XAI_API_KEY",
   "MISTRAL_API_KEY",
   "DEEPSEEK_API_KEY",
+  "OPENROUTER_API_KEY",
   "OLLAMA_HOST",
 ] as const;
 
