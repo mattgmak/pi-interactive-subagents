@@ -1369,6 +1369,39 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("applySandboxToParts loads opencode provider extension for OpenCode Go models", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      const providerDir = join(globalDir, "extensions", "pi-opencode-provider");
+      mkdirSync(providerDir, { recursive: true });
+      writeFileSync(join(providerDir, "index.ts"), "export default function () {}\n");
+
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: "scout",
+          toolAllowlist: "ctx_read,ctx_grep",
+          model: "opencode-go/space-bunny-free",
+          thinking: "medium",
+          systemPromptMode: "append",
+          identity: "You are a scout.",
+          spawnable: null,
+          autoExit: true,
+          cwd: null,
+          agentDir: null,
+        },
+        { artifactDir: globalDir, name: "scout" },
+      );
+
+      const joined = parts.join(" ");
+      assert.ok(
+        joined.includes("opencode-go/space-bunny-free:medium"),
+        "expected Space Bunny Free at medium thinking",
+      );
+      assert.ok(joined.includes("pi-opencode-provider"), "expected pi-opencode-provider extension");
+    });
+  });
+
   it("collectSubagentExtensionPaths includes curated base loaders when installed", () => {
     const paths = testApi.collectSubagentExtensionPaths({
       agent: "scout",

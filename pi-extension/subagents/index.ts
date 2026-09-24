@@ -886,11 +886,18 @@ function formatSandboxModel(model: string, thinking: string | null | undefined):
   return `${model}:${thinking}`;
 }
 
-/** Provider extensions (e.g. cursor) are not tool-backed; load explicitly for --no-extensions children. */
+const PROVIDER_EXTENSION_LOADERS: Record<string, string> = {
+  cursor: "pi-cursor-sdk",
+  opencode: "pi-opencode-provider",
+  "opencode-go": "pi-opencode-provider",
+};
+
+/** Provider extensions are not tool-backed; load explicitly for --no-extensions children. */
 function getProviderExtensionPath(model: string): string | undefined {
   const provider = model.split("/")[0];
-  if (provider !== "cursor") return undefined;
-  const extPath = join(getAgentConfigDir(), "extensions", "pi-cursor-sdk", "index.ts");
+  const loaderName = PROVIDER_EXTENSION_LOADERS[provider];
+  if (!loaderName) return undefined;
+  const extPath = join(getAgentConfigDir(), "extensions", loaderName, "index.ts");
   return existsSync(extPath) ? extPath : undefined;
 }
 
