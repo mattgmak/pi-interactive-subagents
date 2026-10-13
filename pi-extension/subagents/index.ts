@@ -890,6 +890,7 @@ const PROVIDER_EXTENSION_LOADERS: Record<string, string> = {
   cursor: "pi-cursor-sdk",
   opencode: "pi-opencode-provider",
   "opencode-go": "pi-opencode-provider",
+  commandcode: "pi-commandcode-provider",
 };
 
 /** Provider extensions are not tool-backed; load explicitly for --no-extensions children. */
