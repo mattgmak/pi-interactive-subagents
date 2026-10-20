@@ -1543,6 +1543,29 @@ describe("subagent discovery", () => {
     assert.equal(testApi.launchScriptDir(true), "peer-scripts");
   });
 
+  it("peer launches resolve as auto-exit even without auto-exit frontmatter", () => {
+    // A peer hands its result to the parent through the same watcher handoff
+    // as any other subagent, so it must shut down on its final turn.
+    assert.equal(testApi.resolveEffectiveAutoExit({ peer: true }, undefined), true);
+    assert.equal(testApi.resolveEffectiveAutoExit({ autoExit: true }, undefined), true);
+    assert.equal(testApi.resolveEffectiveAutoExit({}, undefined), false);
+    assert.equal(testApi.resolveEffectiveAutoExit(null, undefined), false);
+  });
+
+  it("PI_SUBAGENT_AUTO_EXIT=never opts a peer out of auto-exit", () => {
+    assert.equal(testApi.resolveEffectiveAutoExit({ peer: true }, "never"), false);
+    assert.equal(testApi.resolveEffectiveAutoExit({ autoExit: true }, "never"), false);
+    assert.equal(testApi.resolveEffectiveAutoExit({ peer: true }, " NEVER "), false);
+    assert.equal(testApi.resolveEffectiveAutoExit({ peer: true }, "1"), true);
+  });
+
+  it("peer launches emit PI_SUBAGENT_AUTO_EXIT=1 into the launch command", () => {
+    const peerAutoExit = testApi.resolveEffectiveAutoExit({ peer: true }, undefined);
+    assert.deepEqual(testApi.autoExitEnvParts(peerAutoExit), ["PI_SUBAGENT_AUTO_EXIT=1"]);
+    const optedOut = testApi.resolveEffectiveAutoExit({ peer: true }, "never");
+    assert.deepEqual(testApi.autoExitEnvParts(optedOut), []);
+  });
+
   it("applySandboxToParts omits restriction flags when the loadout was unrestricted", () => {
     withTempDir((d) => {
       const parts: string[] = [];

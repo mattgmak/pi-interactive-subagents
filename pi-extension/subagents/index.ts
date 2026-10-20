@@ -449,6 +449,31 @@ function resolveLaunchBehavior(
   };
 }
 
+/** `PI_SUBAGENT_AUTO_EXIT=never` in the caller env opts a child out. */
+function isAutoExitDisabled(rawValue: string | undefined): boolean {
+  return (rawValue ?? "").trim().toLowerCase() === "never";
+}
+
+function autoExitEnvParts(autoExit: boolean): string[] {
+  return autoExit ? ["PI_SUBAGENT_AUTO_EXIT=1"] : [];
+}
+
+/**
+ * Effective auto-exit for a child launch.
+ *
+ * `auto-exit: true` requests it and `peer: true` implies it. A peer gets its
+ * result through the same watcher handoff as any other subagent, so a peer
+ * that parks after its final turn holds its surface open forever. The caller
+ * can veto both with `PI_SUBAGENT_AUTO_EXIT=never`.
+ */
+export function resolveEffectiveAutoExit(
+  agentDefs: { autoExit?: boolean; peer?: boolean } | null,
+  inherited: string | undefined = process.env.PI_SUBAGENT_AUTO_EXIT,
+): boolean {
+  if (isAutoExitDisabled(inherited)) return false;
+  return agentDefs?.autoExit === true || agentDefs?.peer === true;
+}
+
 /**
  * Decide whether a subagent is interactive (user-driven, long-running).
  *
@@ -1318,6 +1343,8 @@ export const __test__ = {
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
+  resolveEffectiveAutoExit,
+  autoExitEnvParts,
   buildSubagentToolAllowlist,
   formatSandboxModel,
   getProviderExtensionPath,
@@ -1376,6 +1403,7 @@ async function launchSubagent(
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  const effectiveAutoExit = resolveEffectiveAutoExit(agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -1421,10 +1449,10 @@ async function launchSubagent(
   // Build the task message
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = agentDefs?.autoExit
+  const modeHint = effectiveAutoExit
     ? "Complete your task autonomously. When you are finished, simply stop — your session ends automatically."
     : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
-  const summaryInstruction = agentDefs?.autoExit
+  const summaryInstruction = effectiveAutoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
   // An agent with a non-empty subagent_agents list is granted the spawning
@@ -1556,7 +1584,7 @@ async function launchSubagent(
     systemPromptMode: systemPromptMode ?? null,
     identity: identityInSystemPrompt ? identity : null,
     spawnable: agentDefs?.subagentAgents ?? null,
-    autoExit: agentDefs?.autoExit ?? false,
+    autoExit: effectiveAutoExit,
     peer: agentDefs?.peer ?? false,
     cwd: effectiveCwd ?? null,
     agentDir: resolvedAgentDir,
@@ -1581,9 +1609,7 @@ async function launchSubagent(
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
-  if (agentDefs?.autoExit) {
-    envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-  }
+  envParts.push(...autoExitEnvParts(effectiveAutoExit));
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
@@ -2489,9 +2515,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
         pushForwardedEnv(resumeEnvParts);
-        if (autoExit) {
-          resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-        }
+        resumeEnvParts.push(...autoExitEnvParts(autoExit));
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
         // Resume in the subagent's original cwd so its tools (safe_bash, edits)
