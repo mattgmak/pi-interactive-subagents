@@ -1519,6 +1519,30 @@ describe("subagent discovery", () => {
     }
   });
 
+  it("collectSubagentExtensionPaths adds pi-agent-sesh for peer loadouts only", () => {
+    const base = {
+      agent: "peer",
+      toolAllowlist: "read,bash",
+      model: null,
+      thinking: null,
+      systemPromptMode: null,
+      identity: null,
+      spawnable: null,
+      autoExit: false,
+      cwd: null,
+      agentDir: null,
+    };
+    const seshPath = testApi.getCuratedExtensionPath("pi-agent-sesh");
+    if (!seshPath) return;
+    assert.ok([...testApi.collectSubagentExtensionPaths({ ...base, peer: true })].includes(seshPath));
+    assert.ok(![...testApi.collectSubagentExtensionPaths({ ...base, peer: false })].includes(seshPath));
+  });
+
+  it("launchScriptDir keeps peer scripts clear of the subagent marker", () => {
+    assert.equal(testApi.launchScriptDir(false), "subagent-scripts");
+    assert.equal(testApi.launchScriptDir(true), "peer-scripts");
+  });
+
   it("applySandboxToParts omits restriction flags when the loadout was unrestricted", () => {
     withTempDir((d) => {
       const parts: string[] = [];

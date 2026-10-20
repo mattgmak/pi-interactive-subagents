@@ -981,6 +981,13 @@ function collectSubagentExtensionPaths(loadout: SubagentLoadout): Set<string> {
     if (extPath) extPaths.add(extPath);
   }
 
+  // Peers are first-class pi sessions, so they register in the agent-sesh
+  // registry and show up in the picker. Other sandboxed children stay out.
+  if (loadout.peer) {
+    const seshPath = getCuratedExtensionPath("pi-agent-sesh");
+    if (seshPath) extPaths.add(seshPath);
+  }
+
   if (loadout.toolAllowlist) {
     const spawnable = loadout.spawnable && loadout.spawnable.length > 0;
     for (const tool of loadout.toolAllowlist.split(",")) {
@@ -1043,6 +1050,18 @@ function applySandboxToParts(
       parts.push("-e", shellEscape(extPath));
     }
   }
+}
+
+/**
+ * agent-sesh marks a pane as a subagent surface when its command line contains
+ * the `subagent-scripts` marker. Peers must stay attachable as pi sessions, so
+ * their launch scripts live in a marker-free directory.
+ */
+const SUBAGENT_SCRIPT_DIR = "subagent-scripts";
+const PEER_SCRIPT_DIR = "peer-scripts";
+
+function launchScriptDir(peer: boolean): string {
+  return peer ? PEER_SCRIPT_DIR : SUBAGENT_SCRIPT_DIR;
 }
 
 function buildPiPromptArgs(params: {
@@ -1307,6 +1326,7 @@ export const __test__ = {
   getSpawningExtensionPath,
   collectSubagentExtensionPaths,
   applySandboxToParts,
+  launchScriptDir,
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
@@ -1454,7 +1474,7 @@ async function launchSubagent(
       .replace(/\s+/g, "-")
       .replace(/-+/g, "-")
       .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
-    const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+    const launchScriptFile = join(artifactDir, launchScriptDir(agentDefs?.peer ?? false), launchScriptName);
 
     const scriptPath = writeLaunchScript(command, {
       scriptPath: launchScriptFile,
@@ -1502,6 +1522,11 @@ async function launchSubagent(
   // Build pi command
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
+
+  // Peers show their registry label in the agent-sesh picker.
+  if (agentDefs?.peer && params.name) {
+    parts.push("--name", shellEscape(params.name));
+  }
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
@@ -1607,7 +1632,7 @@ async function launchSubagent(
     .replace(/\s+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
-  const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+  const launchScriptFile = join(artifactDir, launchScriptDir(agentDefs?.peer ?? false), launchScriptName);
   const scriptPath = writeLaunchScript(command, {
     scriptPath: launchScriptFile,
     scriptPreamble: [
@@ -2411,6 +2436,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(sessionPath)];
 
+        if (peer) {
+          parts.push("--name", shellEscape(name));
+        }
+
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
         parts.push("-e", shellEscape(subagentDonePath));
@@ -2473,7 +2502,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           `${resumeCdPrefix}${DIRENV_BOOTSTRAP}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
-          "subagent-scripts",
+          launchScriptDir(peer),
           `${name
             .toLowerCase()
             .replace(/[^a-z0-9\s-]/g, "")
