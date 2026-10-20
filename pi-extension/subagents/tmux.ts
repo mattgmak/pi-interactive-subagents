@@ -544,15 +544,18 @@ const EATEN_LAUNCH_DETECTION_MS = 30_000;
  */
 const EATEN_LAUNCH_GRACE_MS = 2_500;
 
+/** Default poll bound: long enough for a full peer ticket, 2 hours. */
+export const DEFAULT_EXIT_TIMEOUT_MS = 120 * 60 * 1000;
+
 /**
  * Overall bound on pollForExit. Override with PI_SUBAGENT_EXIT_TIMEOUT_MS
- * (default 30 minutes). Read in tmux.ts so the whole poll loop — including
+ * (default 2 hours). Read in tmux.ts so the whole poll loop — including
  * the eaten-launch detection — is bounded in one place.
  */
-function getExitTimeoutMs(): number {
+export function getExitTimeoutMs(): number {
   const raw = process.env.PI_SUBAGENT_EXIT_TIMEOUT_MS?.trim();
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30 * 60 * 1000;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_EXIT_TIMEOUT_MS;
 }
 
 export interface PollResult {
@@ -640,7 +643,7 @@ export async function pollForExit(
 
     const elapsed = Date.now() - start;
 
-    // Bound the whole loop: never poll forever. Default 30 min
+    // Bound the whole loop: never poll forever. Default 2 h
     // (PI_SUBAGENT_EXIT_TIMEOUT_MS). Prior behavior hung indefinitely when the
     // DONE sentinel was eaten by shell init — that case is now caught by the
     // eaten-launch detection below, and this is the last-resort bound. The pane
