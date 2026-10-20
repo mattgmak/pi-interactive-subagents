@@ -30,7 +30,14 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import {
+  shellEscape,
+  parseSurfaceTarget,
+  buildPlacementArgs,
+  resumeSurfaceTarget,
+  DEFAULT_EXIT_TIMEOUT_MS,
+  getExitTimeoutMs,
+} from "../pi-extension/subagents/tmux.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -371,14 +378,35 @@ describe("session.ts", () => {
     });
 
     it("accumulates multiple names and overwrites on re-register", () => {
-      const adir = join(dir, "art-2");
-      registerName(adir, "scout", { sessionFile: "/s/scout.jsonl", sessionId: "id-scout" });
-      registerName(adir, "scout-2", { sessionFile: "/s/scout2.jsonl", sessionId: "id-scout2" });
-      const reg = readNameRegistry(adir);
+      const adir2 = join(dir, "art-2");
+      registerName(adir2, "scout", { sessionFile: "/s/scout.jsonl", sessionId: "id-scout" });
+      registerName(adir2, "scout-2", { sessionFile: "/s/scout2.jsonl", sessionId: "id-scout2" });
+      const reg = readNameRegistry(adir2);
       assert.deepEqual(Object.keys(reg).sort(), ["scout", "scout-2"]);
       // Overwrite scout with a new session file.
-      registerName(adir, "scout", { sessionFile: "/s/scout-new.jsonl", sessionId: "id-scout-new" });
-      assert.equal(resolveNameInRegistry(adir, "scout")!.sessionFile, "/s/scout-new.jsonl");
+      registerName(adir2, "scout", { sessionFile: "/s/scout-new.jsonl", sessionId: "id-scout-new" });
+      assert.equal(resolveNameInRegistry(adir2, "scout")!.sessionFile, "/s/scout-new.jsonl");
+    });
+
+    it("stores a peer placement and resolves its resume target", () => {
+      const adir = join(dir, "art-peer");
+      const surface = { target: "NEW peers", session: "peers", pane: "%42" };
+      registerName(adir, "peer-1", {
+        sessionFile: "/s/peer.jsonl",
+        sessionId: "id-peer",
+        surface,
+      });
+      const entry = resolveNameInRegistry(adir, "peer-1")!;
+      assert.deepEqual(entry.surface, surface);
+      assert.equal(resumeSurfaceTarget(entry.surface), "NEW peers");
+    });
+
+    it("keeps entries written before surface targeting resumable", () => {
+      const adir = join(dir, "art-legacy");
+      registerName(adir, "old", { sessionFile: "/s/old.jsonl", sessionId: "id-old" });
+      const entry = resolveNameInRegistry(adir, "old")!;
+      assert.equal(entry.surface, undefined);
+      assert.equal(resumeSurfaceTarget(entry.surface), undefined);
     });
 
     it("returns null for unknown names and {} for a missing/corrupt registry", () => {
@@ -1128,6 +1156,24 @@ describe("subagent discovery", () => {
 
       const loaded = testApi.loadAgentDefaults("interactive-unset-test-agent");
       assert.equal(loaded?.interactive, undefined);
+    });
+  });
+
+  it("parses the peer flag from frontmatter (absent → false)", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "peer-flag-on",
+        ["name: peer-flag-on", "description: Flagged peer", "peer: true"].join("\n"),
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "peer-flag-off",
+        ["name: peer-flag-off", "description: No flag"].join("\n"),
+      );
+
+      assert.equal(testApi.loadAgentDefaults("peer-flag-on")?.peer, true);
+      assert.equal(testApi.loadAgentDefaults("peer-flag-off")?.peer, false);
     });
   });
 
@@ -2002,7 +2048,7 @@ describe("tool registration", () => {
     assert.match(result.content[0].text, /not a known agent/i);
   });
 
-  it("exposes a debloated schema: agent+task required, name/model/cwd optional, no override knobs", () => {
+  it("exposes a debloated schema: agent+task required, name/model/cwd/surface optional, no override knobs", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -2012,8 +2058,8 @@ describe("tool registration", () => {
     const props = subagentTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["agent", "cwd", "model", "name", "task"],
-      "only agent/task/name/model/cwd should remain",
+      ["agent", "cwd", "model", "name", "surface", "task"],
+      "only agent/task/name/model/cwd/surface should remain",
     );
     assert.deepEqual(
       [...(subagentTool.parameters.required ?? [])].sort(),
@@ -2022,10 +2068,93 @@ describe("tool registration", () => {
     );
     // `name` is now optional and purely cosmetic.
     assert.match(props.name.description, /cosmetic/i);
+    // `surface` names the placement modes; the peer agent requires one.
+    assert.match(props.surface.description, /new-window/);
+    assert.match(props.surface.description, /NEW <name>/);
+    assert.match(props.surface.description, /peer/);
     // The removed override knobs must be gone.
     for (const gone of ["tools", "skills", "systemPrompt", "fork", "interactive", "resumeSessionId"]) {
       assert.equal(props[gone], undefined, `expected ${gone} param to be removed`);
     }
+  });
+
+  it("rejects a pane surface for an agent whose frontmatter sets peer: true", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "peer",
+        ["name: peer", "description: Full pi peer", "peer: true"].join("\n"),
+      );
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+      assert.ok(subagentTool, "expected subagent tool to be registered");
+
+      const pane = await subagentTool.execute("call-1", { agent: "peer", task: "do it" });
+      assert.match(String(pane.details?.error), /explicit surface target/);
+      assert.match(String(pane.details?.error), /never runs in a pane/);
+
+      const explicit = await subagentTool.execute("call-2", {
+        agent: "peer",
+        task: "do it",
+        surface: "NEW peers",
+      }, undefined, undefined, {
+        // Stops right after the surface check, before any tmux launch.
+        sessionManager: { getSessionFile: () => null, getSessionId: () => "id", getSessionDir: () => tmpdir() },
+        cwd: tmpdir(),
+      } as any);
+      assert.doesNotMatch(String(explicit.details?.error ?? ""), /explicit surface target/);
+    });
+  });
+
+  it("gates peer behaviour on the frontmatter flag, not the agent name", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      // The `peer` name alone grants nothing.
+      writeAgentFile(
+        projectAgentsDir,
+        "peer",
+        ["name: peer", "description: Name only, no flag"].join("\n"),
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "flagged-peer-agent",
+        ["name: flagged-peer-agent", "description: Flag only", "peer: true"].join("\n"),
+      );
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+      assert.ok(subagentTool, "expected subagent tool to be registered");
+
+      const ctx = {
+        sessionManager: {
+          getSessionFile: () => null,
+          getSessionId: () => "id",
+          getSessionDir: () => tmpdir(),
+        },
+        cwd: tmpdir(),
+      } as any;
+
+      const byName = await subagentTool.execute(
+        "call-1",
+        { agent: "peer", task: "do it" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.doesNotMatch(String(byName.details?.error ?? ""), /explicit surface target/);
+
+      const byFlag = await subagentTool.execute(
+        "call-2",
+        { agent: "flagged-peer-agent", task: "do it" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.match(String(byFlag.details?.error), /explicit surface target/);
+      assert.match(String(byFlag.details?.error), /never runs in a pane/);
+    });
   });
 
   it("renders partial subagent tool-call args without throwing", () => {
@@ -2825,6 +2954,106 @@ describe("tmux.ts", () => {
       assert.ok(escaped.endsWith("'"));
       // Inside single quotes, everything is literal
       assert.ok(escaped.includes("$world"));
+    });
+  });
+
+  describe("parseSurfaceTarget", () => {
+    it("defaults to a pane split", () => {
+      assert.deepEqual(parseSurfaceTarget(undefined), { kind: "pane" });
+      assert.deepEqual(parseSurfaceTarget("   "), { kind: "pane" });
+    });
+
+    it("maps new-window to a window in the caller session", () => {
+      assert.deepEqual(parseSurfaceTarget("new-window"), { kind: "window" });
+    });
+
+    it("treats any other value as an existing session name", () => {
+      assert.deepEqual(parseSurfaceTarget("tickets"), { kind: "session", session: "tickets" });
+    });
+
+    it("parses NEW <name> into a detached new session", () => {
+      assert.deepEqual(parseSurfaceTarget("NEW tickets"), {
+        kind: "new-session",
+        session: "tickets",
+      });
+      assert.deepEqual(parseSurfaceTarget("  NEW  my session "), {
+        kind: "new-session",
+        session: "my session",
+      });
+    });
+  });
+
+  describe("buildPlacementArgs", () => {
+    it("creates a detached window in the caller session for new-window", () => {
+      const args = buildPlacementArgs(parseSurfaceTarget("new-window"), "/tmp/launch.sh", undefined, true);
+      assert.equal(args[0], "new-window");
+      assert.equal(args[1], "-d");
+      assert.ok(!args.includes("-t"), "new-window must not name a session");
+      assert.equal(args.at(-1), `bash ${shellEscape("/tmp/launch.sh")}`);
+      assert.ok(args.includes("#{pane_id}"), "placement must resolve the new pane id");
+    });
+
+    it("targets the named session for an existing session name", () => {
+      const args = buildPlacementArgs(parseSurfaceTarget("tickets"), "/tmp/launch.sh", "/work", true);
+      assert.deepEqual(args.slice(0, 4), ["new-window", "-d", "-t", "tickets:"]);
+      assert.deepEqual(args.slice(4, 6), ["-P", "-F"]);
+      assert.ok(args.includes("-c"));
+      assert.ok(args.includes("/work"));
+    });
+
+    it("creates a detached new session when the name is free", () => {
+      const args = buildPlacementArgs(parseSurfaceTarget("NEW peers"), "/tmp/launch.sh", undefined, false);
+      assert.deepEqual(args.slice(0, 4), ["new-session", "-d", "-s", "peers"]);
+      assert.equal(args.at(-1), `bash ${shellEscape("/tmp/launch.sh")}`);
+    });
+
+    it("reopens a live session as a window instead of failing", () => {
+      const args = buildPlacementArgs(parseSurfaceTarget("NEW peers"), "/tmp/launch.sh", undefined, true);
+      assert.equal(args[0], "new-window");
+      assert.ok(args.includes("peers:"));
+    });
+  });
+
+  describe("resumeSurfaceTarget", () => {
+    it("has no target when no placement was recorded", () => {
+      assert.equal(resumeSurfaceTarget(undefined), undefined);
+      assert.equal(resumeSurfaceTarget(null), undefined);
+    });
+
+    it("reopens the recorded session, even for a new-window spawn", () => {
+      assert.equal(
+        resumeSurfaceTarget({ target: "new-window", session: "work" }),
+        "NEW work",
+      );
+    });
+
+    it("replays the recorded target when the session is unknown", () => {
+      assert.equal(
+        resumeSurfaceTarget({ target: "NEW peers", session: null }),
+        "NEW peers",
+      );
+      assert.equal(resumeSurfaceTarget({ target: null, session: null }), undefined);
+    });
+  });
+
+  describe("exit timeout", () => {
+    it("defaults to two hours", () => {
+      assert.equal(DEFAULT_EXIT_TIMEOUT_MS, 120 * 60 * 1000);
+    });
+
+    it("honours PI_SUBAGENT_EXIT_TIMEOUT_MS and falls back otherwise", () => {
+      const previous = process.env.PI_SUBAGENT_EXIT_TIMEOUT_MS;
+      try {
+        delete process.env.PI_SUBAGENT_EXIT_TIMEOUT_MS;
+        assert.equal(getExitTimeoutMs(), 120 * 60 * 1000);
+        process.env.PI_SUBAGENT_EXIT_TIMEOUT_MS = "5000";
+        assert.equal(getExitTimeoutMs(), 5000);
+        process.env.PI_SUBAGENT_EXIT_TIMEOUT_MS = "nonsense";
+        assert.equal(getExitTimeoutMs(), 120 * 60 * 1000);
+      } finally {
+        if (previous === undefined) delete process.env.PI_SUBAGENT_EXIT_TIMEOUT_MS;
+        else process.env.PI_SUBAGENT_EXIT_TIMEOUT_MS = previous;
+      }
     });
   });
 });
