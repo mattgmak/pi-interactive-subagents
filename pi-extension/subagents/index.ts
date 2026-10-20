@@ -161,6 +161,14 @@ const SubagentParams = Type.Object({
         'An agent with `peer: true` in its frontmatter requires one of the non-pane values.',
     }),
   ),
+  // Names the tmux window for the three window-creating surface kinds. A pane
+  // split has no window of its own, so this is a schema error there.
+  windowName: Type.Optional(
+    Type.String({
+      description:
+        "Name for the tmux window created by a window-creating surface. Ignored for a pane split.",
+    }),
+  ),
 });
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
@@ -1486,7 +1494,13 @@ async function launchSubagent(
     const preCreated = options?.surface;
     const placement = preCreated
       ? null
-      : launchSurfaceAt(params.name, scriptPath, effectiveCwd ?? undefined, params.surface);
+      : launchSurfaceAt(
+          params.name,
+          scriptPath,
+          effectiveCwd ?? undefined,
+          params.surface,
+          params.windowName,
+        );
     const surface = preCreated ?? placement!.pane;
     if (preCreated) {
       // Parallel-mode surface already exists: drive it by typing (flush is
@@ -1644,7 +1658,13 @@ async function launchSubagent(
   const preCreated = options?.surface;
   const placement = preCreated
     ? null
-    : launchSurfaceAt(params.name, scriptPath, effectiveCwd ?? undefined, params.surface);
+    : launchSurfaceAt(
+        params.name,
+        scriptPath,
+        effectiveCwd ?? undefined,
+        params.surface,
+        params.windowName,
+      );
   const surface = preCreated ?? placement!.pane;
   if (preCreated) {
     sendCommand(surface, `bash ${shellEscape(scriptPath)}`, true);
@@ -1995,6 +2015,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               error: SUBAGENT_ALLOWLIST ? "agent not in allowlist" : "unknown agent",
             },
           };
+        }
+
+        // A window name needs a window. A pane split reuses the caller's
+        // window, so naming one there has no target.
+        if (params.windowName?.trim() && parseSurfaceTarget(params.surface).kind === "pane") {
+          const err =
+            `A window name needs a window-creating surface target: "new-window", an existing tmux ` +
+            `session name, or "NEW <name>". A pane split has no window of its own.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
         // A peer never shares the caller's window: it needs an explicit

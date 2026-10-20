@@ -2082,8 +2082,8 @@ describe("tool registration", () => {
     const props = subagentTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["agent", "cwd", "model", "name", "surface", "task"],
-      "only agent/task/name/model/cwd/surface should remain",
+      ["agent", "cwd", "model", "name", "surface", "task", "windowName"],
+      "only agent/task/name/model/cwd/surface/windowName should remain",
     );
     assert.deepEqual(
       [...(subagentTool.parameters.required ?? [])].sort(),
@@ -2096,10 +2096,52 @@ describe("tool registration", () => {
     assert.match(props.surface.description, /new-window/);
     assert.match(props.surface.description, /NEW <name>/);
     assert.match(props.surface.description, /peer/);
+    // `windowName` names the tmux window that a window-creating surface makes.
+    assert.match(props.windowName.description, /window/);
     // The removed override knobs must be gone.
     for (const gone of ["tools", "skills", "systemPrompt", "fork", "interactive", "resumeSessionId"]) {
       assert.equal(props[gone], undefined, `expected ${gone} param to be removed`);
     }
+  });
+
+  it("rejects a window name for a pane surface", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "solo",
+        ["name: solo", "description: Plain subagent"].join("\n"),
+      );
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+      assert.ok(subagentTool, "expected subagent tool to be registered");
+
+      const pane = await subagentTool.execute("call-1", {
+        agent: "solo",
+        task: "do it",
+        windowName: "recon",
+      });
+      assert.match(String(pane.details?.error), /window-creating surface target/);
+      assert.match(String(pane.details?.error), /pane split has no window/);
+
+      const window = await subagentTool.execute(
+        "call-2",
+        { agent: "solo", task: "do it", surface: "new-window", windowName: "recon" },
+        undefined,
+        undefined,
+        {
+          // Stops right after the surface checks, before any tmux launch.
+          sessionManager: {
+            getSessionFile: () => null,
+            getSessionId: () => "id",
+            getSessionDir: () => tmpdir(),
+          },
+          cwd: tmpdir(),
+        } as any,
+      );
+      assert.doesNotMatch(String(window.details?.error ?? ""), /window-creating surface target/);
+    });
   });
 
   it("rejects a pane surface for an agent whose frontmatter sets peer: true", async () => {
@@ -3035,6 +3077,65 @@ describe("tmux.ts", () => {
       const args = buildPlacementArgs(parseSurfaceTarget("NEW peers"), "/tmp/launch.sh", undefined, true);
       assert.equal(args[0], "new-window");
       assert.ok(args.includes("peers:"));
+    });
+
+    it("names the window for new-window", () => {
+      const args = buildPlacementArgs(
+        parseSurfaceTarget("new-window"),
+        "/tmp/launch.sh",
+        undefined,
+        true,
+        "recon",
+      );
+      assert.deepEqual(args.slice(0, 4), ["new-window", "-d", "-n", "recon"]);
+      assert.equal(args.at(-1), `bash ${shellEscape("/tmp/launch.sh")}`);
+    });
+
+    it("names the window after the session target for a named session", () => {
+      const args = buildPlacementArgs(
+        parseSurfaceTarget("tickets"),
+        "/tmp/launch.sh",
+        undefined,
+        true,
+        "recon",
+      );
+      assert.deepEqual(args.slice(0, 6), ["new-window", "-d", "-t", "tickets:", "-n", "recon"]);
+    });
+
+    it("names the first window of a freshly created session", () => {
+      const args = buildPlacementArgs(
+        parseSurfaceTarget("NEW peers"),
+        "/tmp/launch.sh",
+        undefined,
+        false,
+        "recon",
+      );
+      assert.deepEqual(args.slice(0, 6), ["new-session", "-d", "-s", "peers", "-n", "recon"]);
+    });
+
+    it("names the window when a new-session target falls back to its live session", () => {
+      const args = buildPlacementArgs(
+        parseSurfaceTarget("NEW peers"),
+        "/tmp/launch.sh",
+        undefined,
+        true,
+        "recon",
+      );
+      assert.deepEqual(args.slice(0, 6), ["new-window", "-d", "-t", "peers:", "-n", "recon"]);
+    });
+
+    it("adds no -n when no window name is given", () => {
+      for (const raw of ["new-window", "tickets", "NEW peers"]) {
+        for (const sessionExists of [true, false]) {
+          const args = buildPlacementArgs(
+            parseSurfaceTarget(raw),
+            "/tmp/launch.sh",
+            undefined,
+            sessionExists,
+          );
+          assert.ok(!args.includes("-n"), `${raw} must not name a window by default`);
+        }
+      }
     });
   });
 

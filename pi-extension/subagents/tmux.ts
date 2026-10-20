@@ -246,24 +246,28 @@ function tmuxSessionExists(name: string): boolean {
  * tmux argv that creates the surface for a parsed non-pane target. `pane` is
  * handled by `launchSurface` and never reaches here. A `new-session` target
  * falls back to a window when the session already exists, so `NEW <name>`
- * reopens a live session instead of failing.
+ * reopens a live session instead of failing. `windowName` names that window.
  */
 export function buildPlacementArgs(
   target: SurfaceTarget,
   scriptPath: string,
   cwd: string | undefined,
   sessionExists: boolean,
+  windowName?: string,
 ): string[] {
   const workdir = cwd ? ["-c", cwd] : [];
+  const name = windowName?.trim();
+  const named = name ? ["-n", name] : [];
   const tail = ["-P", "-F", "#{pane_id}", ...workdir, `bash ${shellEscape(scriptPath)}`];
   if (target.kind === "new-session" && !sessionExists) {
-    return ["new-session", "-d", "-s", target.session!, ...tail];
+    return ["new-session", "-d", "-s", target.session!, ...named, ...tail];
   }
   return [
     "new-window",
     "-d",
     // A trailing colon targets the session itself, not its active window.
     ...(target.session ? ["-t", `${target.session}:`] : []),
+    ...named,
     ...tail,
   ];
 }
@@ -291,6 +295,7 @@ export function launchSurfaceAt(
   scriptPath: string,
   cwd: string | undefined,
   raw?: string | null,
+  windowName?: string,
 ): SurfacePlacement {
   const target = parseSurfaceTarget(raw);
   if (target.kind === "pane") {
@@ -304,6 +309,7 @@ export function launchSurfaceAt(
     scriptPath,
     cwd,
     target.kind === "new-session" ? tmuxSessionExists(target.session!) : true,
+    windowName,
   );
   const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
   if (!pane.startsWith("%")) {
