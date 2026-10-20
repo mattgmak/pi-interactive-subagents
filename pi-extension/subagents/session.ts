@@ -110,6 +110,8 @@ export interface SubagentLoadout {
   spawnable: string[] | null;
   /** Whether the agent auto-exits (informational; resume forces autonomous). */
   autoExit: boolean;
+  /** Whether the agent declared `peer: true` (resume keeps the peer placement rule). */
+  peer?: boolean;
   /** Working directory the subagent ran in, or null. */
   cwd: string | null;
   /** PI_CODING_AGENT_DIR the subagent resolved config/extensions from, or null. */
@@ -153,11 +155,23 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
 // lives in the spawner's own artifact dir, which is directly addressable from
 // the spawner's session id (no sessions-tree scan, so resume stays fast).
 
+/** Where a subagent's tmux surface lived, so a resume can relaunch there. */
+export interface RegisteredSurface {
+  /** The `surface` spawn argument (null = pane split). */
+  target: string | null;
+  /** tmux session hosting the surface, or null if unknown. */
+  session: string | null;
+  /** tmux pane id, e.g. `%12`. */
+  pane: string;
+}
+
 export interface NameRegistryEntry {
   /** Absolute path to the subagent's session .jsonl file. */
   sessionFile: string;
   /** Canonical session header id (kept for display/lineage). */
   sessionId: string | null;
+  /** Launch placement; absent for entries written before surface targeting. */
+  surface?: RegisteredSurface | null;
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;

@@ -9,6 +9,10 @@
  * Panes are identified by tmux pane ids (e.g. `%12`). Splits always target
  * the parent pi's pane (`$TMUX_PANE`) so they follow the agent rather than
  * the user's focus.
+ *
+ * `launchSurfaceAt` places a subagent outside that pane when the spawner asks
+ * for it: a new window, a window in another tmux session, or a detached new
+ * session. Peers use those modes; plain subagents keep the pane split.
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
@@ -174,6 +178,143 @@ export function launchSurface(name: string, scriptPath: string, cwd?: string): s
     cwd,
     command: `bash ${shellEscape(scriptPath)}`,
   });
+}
+
+// ── Placement targets ──
+
+/**
+ * Where a subagent pane goes. `pane` splits beside the caller; the others are
+ * cross-session placements that only peers (and explicit `surface` callers)
+ * use.
+ */
+export interface SurfaceTarget {
+  kind: "pane" | "window" | "session" | "new-session";
+  /** Session name for kinds `session` and `new-session`. */
+  session?: string;
+}
+
+/**
+ * Parse the `surface` spawn argument:
+ * - omitted → `pane` (split beside the caller, existing behavior)
+ * - `new-window` → new window in the caller's tmux session
+ * - any other name → new window in that existing tmux session
+ * - `NEW <name>` → detached new session named `<name>`
+ */
+export function parseSurfaceTarget(raw?: string | null): SurfaceTarget {
+  const value = raw?.trim();
+  if (!value) return { kind: "pane" };
+  if (value === "new-window") return { kind: "window" };
+  const detached = value.match(/^NEW\s+(.+)$/);
+  if (detached) return { kind: "new-session", session: detached[1].trim() };
+  return { kind: "session", session: value };
+}
+
+/** Resolved placement of a launched subagent surface. */
+export interface SurfacePlacement {
+  /** The `surface` argument that produced this placement (null = pane split). */
+  target: string | null;
+  /** tmux session hosting the new surface. */
+  session: string | null;
+  /** tmux pane id, e.g. `%12`. */
+  pane: string;
+}
+
+/** Name of the tmux session hosting a pane, or null if unreachable. */
+export function sessionNameFor(surface: string): string | null {
+  try {
+    const name = execFileSync(
+      "tmux",
+      ["display-message", "-p", "-t", surface, "#{session_name}"],
+      { encoding: "utf8" },
+    ).trim();
+    return name || null;
+  } catch {
+    return null;
+  }
+}
+
+function tmuxSessionExists(name: string): boolean {
+  try {
+    execFileSync("tmux", ["has-session", "-t", `=${name}`], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * tmux argv that creates the surface for a parsed non-pane target. `pane` is
+ * handled by `launchSurface` and never reaches here. A `new-session` target
+ * falls back to a window when the session already exists, so `NEW <name>`
+ * reopens a live session instead of failing.
+ */
+export function buildPlacementArgs(
+  target: SurfaceTarget,
+  scriptPath: string,
+  cwd: string | undefined,
+  sessionExists: boolean,
+): string[] {
+  const workdir = cwd ? ["-c", cwd] : [];
+  const tail = ["-P", "-F", "#{pane_id}", ...workdir, `bash ${shellEscape(scriptPath)}`];
+  if (target.kind === "new-session" && !sessionExists) {
+    return ["new-session", "-d", "-s", target.session!, ...tail];
+  }
+  return [
+    "new-window",
+    "-d",
+    // A trailing colon targets the session itself, not its active window.
+    ...(target.session ? ["-t", `${target.session}:`] : []),
+    ...tail,
+  ];
+}
+
+/**
+ * `surface` argument that relaunches a recorded placement. A recorded session
+ * wins: `NEW <session>` reopens it, or recreates it if it is gone. Otherwise
+ * the original argument is replayed. `undefined` means no placement recorded.
+ */
+export function resumeSurfaceTarget(
+  surface?: { target: string | null; session: string | null } | null,
+): string | undefined {
+  if (!surface) return undefined;
+  if (surface.session) return `NEW ${surface.session}`;
+  return surface.target ?? undefined;
+}
+
+/**
+ * Launch a subagent surface in the placement the `surface` argument names.
+ * Every mode runs the launch script in command form, so no typed input races
+ * shell init. Windows are created detached: the caller keeps its focus.
+ */
+export function launchSurfaceAt(
+  name: string,
+  scriptPath: string,
+  cwd: string | undefined,
+  raw?: string | null,
+): SurfacePlacement {
+  const target = parseSurfaceTarget(raw);
+  if (target.kind === "pane") {
+    const pane = launchSurface(name, scriptPath, cwd);
+    return { target: raw?.trim() || null, session: sessionNameFor(pane), pane };
+  }
+
+  requireTmux();
+  const args = buildPlacementArgs(
+    target,
+    scriptPath,
+    cwd,
+    target.kind === "new-session" ? tmuxSessionExists(target.session!) : true,
+  );
+  const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
+  if (!pane.startsWith("%")) {
+    throw new Error(`Unexpected tmux placement output: ${pane}`);
+  }
+
+  return {
+    target: raw!.trim(),
+    session: target.session ?? sessionNameFor(pane),
+    pane,
+  };
 }
 
 // ── Shell readiness ──

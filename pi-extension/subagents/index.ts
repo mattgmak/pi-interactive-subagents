@@ -17,7 +17,10 @@ import { homedir } from "node:os";
 import {
   isMuxAvailable,
   muxSetupHint,
-  launchSurface,
+  launchSurfaceAt,
+  parseSurfaceTarget,
+  resumeSurfaceTarget,
+  type SurfacePlacement,
   sendCommand,
   pollForExit,
   closeSurface,
@@ -147,6 +150,17 @@ const SubagentParams = Type.Object({
         "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
     }),
   ),
+  // Where the pane goes: omitted = split beside you; "new-window" = new window
+  // in your tmux session; "<session>" = new window in that session;
+  // "NEW <name>" = detached new session. Required for agents with `peer: true`.
+  surface: Type.Optional(
+    Type.String({
+      description:
+        'Where to launch the pane. Omitted: split beside you. "new-window": new window in your tmux session. ' +
+        'An existing tmux session name: new window there. "NEW <name>": detached new session. ' +
+        'An agent with `peer: true` in its frontmatter requires one of the non-pane values.',
+    }),
+  ),
 });
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
@@ -171,6 +185,11 @@ interface AgentDefaults {
   cli?: string;
   body?: string;
   disableModelInvocation?: boolean;
+  /**
+   * Cross-session peer rights: this agent always launches outside the caller's
+   * pane and must name an explicit non-pane `surface`. Absent → false.
+   */
+  peer?: boolean;
 }
 
 type AgentSource = "package" | "global" | "project";
@@ -198,6 +217,16 @@ const SPAWNING_TOOLS = [
 
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
+
+/**
+ * Peer agents launch outside the caller's pane and must name an explicit
+ * `surface` target. The flag is frontmatter-driven (`peer: true`), so any agent
+ * can opt in regardless of its name.
+ */
+function isPeerAgent(agent: string | null | undefined): boolean {
+  if (!agent) return false;
+  return loadAgentDefaults(agent)?.peer ?? false;
+}
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
 function getAgentConfigDir(): string {
@@ -337,6 +366,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     body: body || undefined,
     disableModelInvocation:
       getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
+    peer: parseOptionalBoolean(getFrontmatterValue(frontmatter, "peer")) ?? false,
   };
 }
 
@@ -574,6 +604,16 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
+/**
+ * Registry scope shared by every peer spawner session in the same session dir,
+ * so a peer spawned by one session is resumable from any other.
+ */
+const SHARED_REGISTRY_SCOPE = "_peers";
+
+function getSharedArtifactDir(sessionDir: string): string {
+  return getArtifactDir(sessionDir, SHARED_REGISTRY_SCOPE);
+}
+
 const statusConfig = loadStatusConfig();
 
 function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
@@ -667,6 +707,8 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
+  /** tmux placement, recorded in the name registry so resume relaunches there. */
+  placement?: SurfacePlacement;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -1337,10 +1379,9 @@ async function launchSubagent(
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
   // Pre-created surface (parallel mode) is used as-is; a new surface is
-  // created by each launch branch AFTER its launch script is written, using
-  // command form (`tmux split-window 'bash <script>'` as the pane program),
-  // so the script runs through /bin/sh — no typed input, no shell-init race.
-  const surfacePreCreated = !!options?.surface;
+  // placed by each launch branch AFTER its launch script is written, in
+  // command form (`bash <script>` as the pane program), so the script runs
+  // through /bin/sh — no typed input, no shell-init race.
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
@@ -1422,9 +1463,12 @@ async function launchSubagent(
         `# Generated: ${new Date().toISOString()}`,
       ].join("\n"),
     });
-    const surface =
-      options?.surface ?? launchSurface(params.name, scriptPath, effectiveCwd ?? undefined);
-    if (surfacePreCreated) {
+    const preCreated = options?.surface;
+    const placement = preCreated
+      ? null
+      : launchSurfaceAt(params.name, scriptPath, effectiveCwd ?? undefined, params.surface);
+    const surface = preCreated ?? placement!.pane;
+    if (preCreated) {
       // Parallel-mode surface already exists: drive it by typing (flush is
       // safe — sendCommand only clears when the pane runs an interactive shell).
       sendCommand(surface, `bash ${shellEscape(scriptPath)}`, true);
@@ -1441,6 +1485,7 @@ async function launchSubagent(
       launchScriptFile,
       cli: "claude",
       sentinelFile,
+      ...(placement ? { placement } : {}),
       interactive: effectiveInteractive,
       statusState: createStatusState({
         source: "claude",
@@ -1487,6 +1532,7 @@ async function launchSubagent(
     identity: identityInSystemPrompt ? identity : null,
     spawnable: agentDefs?.subagentAgents ?? null,
     autoExit: agentDefs?.autoExit ?? false,
+    peer: agentDefs?.peer ?? false,
     cwd: effectiveCwd ?? null,
     agentDir: resolvedAgentDir,
   };
@@ -1570,8 +1616,12 @@ async function launchSubagent(
       `# Session: ${subagentSessionFile}`,
     ].join("\n"),
   });
-  const surface = options?.surface ?? launchSurface(params.name, scriptPath, effectiveCwd ?? undefined);
-  if (surfacePreCreated) {
+  const preCreated = options?.surface;
+  const placement = preCreated
+    ? null
+    : launchSurfaceAt(params.name, scriptPath, effectiveCwd ?? undefined, params.surface);
+  const surface = preCreated ?? placement!.pane;
+  if (preCreated) {
     sendCommand(surface, `bash ${shellEscape(scriptPath)}`, true);
   }
 
@@ -1586,6 +1636,7 @@ async function launchSubagent(
     launchScriptFile,
     activityFile,
     interactive: effectiveInteractive,
+    ...(placement ? { placement } : {}),
     statusState: createStatusState({
       source: "pi",
       startTimeMs: startTime,
@@ -1921,6 +1972,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        // A peer never shares the caller's window: it needs an explicit
+        // non-pane `surface` target, so it can never land as a pane beside you.
+        const peer = isPeerAgent(params.agent);
+        if (peer && parseSurfaceTarget(params.surface).kind === "pane") {
+          const err =
+            `The "${params.agent}" agent is a peer and needs an explicit surface target: "new-window", ` +
+            `an existing tmux session name, or "NEW <name>". A peer never runs in a pane beside you.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
         // Validate prerequisites (need mux + a session file to derive the
         // artifact dir that hosts this session's name registry).
         if (!isMuxAvailable()) {
@@ -1945,6 +2006,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ctx.sessionManager.getSessionDir(),
           ctx.sessionManager.getSessionId(),
         );
+        // Peers also register in the shared registry so any session can resume
+        // them — their names must stay unique against it too.
+        const sharedArtifactDir = getSharedArtifactDir(ctx.sessionManager.getSessionDir());
 
         // Default the cosmetic pane label to the agent name when omitted,
         // disambiguating against running subagents, in-flight reservations, and
@@ -1954,6 +2018,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         let reservedName: string | null = null;
         if (!params.name?.trim()) {
           const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
+          if (peer) {
+            for (const n of Object.keys(readNameRegistry(sharedArtifactDir))) registryNames.add(n);
+          }
           params.name = uniqueRunningName(params.agent, registryNames);
           reservedName = params.name;
           reservedNames.add(reservedName);
@@ -1972,10 +2039,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Persist name → session so subagent_message({ name }) can resume this
         // subagent after it finishes (and after a pi restart). Done at launch,
         // not completion, so the handle exists even if the parent dies mid-run.
-        registerName(parentArtifactDir, running.name, {
+        // The placement lets a resume relaunch in the same session/window;
+        // only an explicit `surface` target is worth replaying.
+        const registered = {
           sessionFile: running.sessionFile,
           sessionId: getSessionId(running.sessionFile),
-        });
+          surface: running.placement?.target ? running.placement : null,
+        };
+        registerName(parentArtifactDir, running.name, registered);
+        if (peer) registerName(sharedArtifactDir, running.name, registered);
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -2264,13 +2336,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ctx.sessionManager.getSessionDir(),
           ctx.sessionManager.getSessionId(),
         );
-        const entry = resolveNameInRegistry(parentArtifactDir, requestedName);
+        const sharedArtifactDir = getSharedArtifactDir(ctx.sessionManager.getSessionDir());
+        let entry = resolveNameInRegistry(parentArtifactDir, requestedName);
+        // Peers register in the shared registry, so any session can resume them.
+        if (!entry) entry = resolveNameInRegistry(sharedArtifactDir, requestedName);
         if (!entry) {
-          const known = Object.keys(readNameRegistry(parentArtifactDir));
+          const known = new Set([
+            ...Object.keys(readNameRegistry(parentArtifactDir)),
+            ...Object.keys(readNameRegistry(sharedArtifactDir)),
+          ]);
           const err =
             `No subagent named "${requestedName}" in this session. ` +
-            (known.length > 0
-              ? `Known subagents: ${known.join(", ")}.`
+            (known.size > 0
+              ? `Known subagents: ${[...known].join(", ")}.`
               : "No subagents have been spawned in this session yet.");
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
@@ -2312,9 +2390,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
-        // Surface is created below, after the resume script is written —
+        // Surface is placed below, after the resume script is written —
         // command-form spawn (`bash <script>` as pane program), no typed
-        // input, no shell-init race.
+        // input, no shell-init race. A recorded placement relaunches into the
+        // same tmux session: `NEW <name>` reopens it, or recreates it if gone.
+        const resumeTarget = resumeSurfaceTarget(entry.surface);
+
+        // The peer flag is snapshotted, so a later frontmatter edit cannot
+        // change how an existing session resumes.
+        const peer = loadout.peer ?? isPeerAgent(loadout.agent);
+
+        // A peer never returns to a pane, so a missing placement is a hard stop.
+        if (peer && !resumeTarget) {
+          const err =
+            `Cannot resume peer "${requestedName}": its launch surface was never recorded. ` +
+            `Spawn a fresh peer with an explicit surface target instead.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(sessionPath)];
@@ -2398,14 +2490,30 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
           ].join("\n"),
         });
-        const surface = launchSurface(name, scriptPath, loadout.cwd ?? undefined);
+        const placement = launchSurfaceAt(
+          name,
+          scriptPath,
+          loadout.cwd ?? undefined,
+          resumeTarget,
+        );
+
+        // Keep the recorded placement in sync so the next resume lands in the
+        // same place, and register locally so this session can resume it again.
+        const registered = {
+          sessionFile: sessionPath,
+          sessionId: resumedSessionId,
+          surface: placement.target ? placement : null,
+        };
+        registerName(parentArtifactDir, name, registered);
+        if (peer) registerName(sharedArtifactDir, name, registered);
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
           id,
           name,
           task: message,
-          surface,
+          surface: placement.pane,
+          placement,
           startTime,
           sessionFile: sessionPath,
           launchScriptFile,
