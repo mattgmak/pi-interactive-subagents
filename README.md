@@ -41,6 +41,7 @@ There is also a `/subagent <agent> <task>` command for spawning directly.
 ```typescript
 subagent({ agent: "scout", task: "Analyze the auth module" });
 subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode toggle" });
+subagent({ agent: "worker", task: "Review the diff", surface: "window:work" });
 ```
 
 | Parameter | Type | Default | Description |
@@ -50,6 +51,8 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
 | `model` | string | agent's model | Override the model for this spawn |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
+| `surface` | string | `pane` | Placement: `pane`, `window`, `window:<session>`, `new-session:<name>`, or a bare tmux session name (see [surface argument](#surface-argument)) |
+| `windowName` | string | none | Window name for a window-creating surface. Rejected for a pane split |
 
 ### Messaging
 
@@ -81,6 +84,8 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 | **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
 
 All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
+
+`agents/peer.md` is an example peer agent. It allows window and session spawns only.
 
 ## Custom agents
 
@@ -114,6 +119,7 @@ You are a specialized agent that does X...
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
 | `system-prompt` | string | `append` or `replace`: pass the body as the child's `--append-system-prompt` / `--system-prompt`. Omit and the body is prepended to the task prompt instead |
 | `auto-exit` | boolean | Auto-shutdown when the agent finishes (see below) |
+| `surfaces` | string | Spawn surfaces this agent allows: `pane`, `window`, or `session`. Comma-separated. Default: `pane` only. See the surface argument grammar below |
 | `interactive` | boolean | Whether stall/recovery transitions wake the parent (see below) |
 | `cwd` | string | Default working directory |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
@@ -137,6 +143,36 @@ Notes:
 ### interactive
 
 Controls whether `stalled`/`recovered` status transitions send a steer message to the parent session. Defaults to the inverse of `auto-exit`: autonomous agents get stall pings; user-driven agents stay quiet (the user is already working in that pane — the widget still updates). Set explicitly to override.
+
+### surfaces
+
+`surfaces` limits where an agent can spawn:
+
+- `pane` — split beside the caller
+- `window` — new window in your tmux session, or a window in a named session
+- `session` — an existing tmux session, or a detached new session
+
+The default is `pane` only, for every agent. Write a comma-separated list, for example `surfaces: window, session`. Flow style `[window, session]` also parses. Unknown values are dropped. If the list holds no valid value, the agent allows `pane` only.
+
+A spawn that requests a rejected surface fails:
+
+```
+The "peer" agent cannot spawn as "pane". Allowed surfaces: window, session.
+```
+
+### surface argument
+
+The `surface` spawn argument names the placement. The grammar is fixed:
+
+- Omitted, empty, or `pane` — split beside the caller. This is the default.
+- `window` — new window in the caller's tmux session.
+- `window:<session>` — new window inside the existing tmux session `<session>`.
+- `new-session:<name>` — detached new tmux session named `<name>`.
+- Any other bare token — new window inside that existing tmux session. Example: `work`.
+
+A colon is reserved for the `window:` and `new-session:` prefixes. Thus a bare tmux session name must not hold a colon. The `window:<session>` form, a bare session name, and `new-session:<name>` all request the `session` policy kind.
+
+The extension rejects the legacy forms. A `new-window` value fails with `Invalid surface "new-window". Use "window".` A `NEW <name>` value fails with `Invalid surface "NEW <name>". Use "new-session:<name>".` Other invalid values, such as `window:` or `foo:bar`, fail with a message that lists the grammar.
 
 ## Tool access control
 
@@ -183,6 +219,22 @@ Status display is configured via `config.json` in the extension directory (copy 
 ```bash
 tmux new -A -s pi 'pi'
 ```
+
+## Integration tests
+
+The integration tests drive real pi sessions inside tmux. The LLM suite needs a model.
+
+Set `PI_TEST_MODEL` to one full model id. This example uses an OpenRouter model:
+
+```bash
+PI_TEST_MODEL=openrouter/z-ai/glm-5.3 npm run test:integration
+```
+
+When `PI_TEST_MODEL` is unset, the harness reads `defaultModel` from the host pi settings file. The harness uses `$PI_CODING_AGENT_DIR/settings.json` when `PI_CODING_AGENT_DIR` is set. Else it uses `~/.pi/agent/settings.json`.
+
+When no model resolves, the LLM suite skips. The skip message names `PI_TEST_MODEL`. The surface tests need no model and still run.
+
+`PI_TEST_TIMEOUT` sets the per-test timeout in milliseconds.
 
 ## Acknowledgements
 

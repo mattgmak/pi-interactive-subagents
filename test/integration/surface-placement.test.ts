@@ -78,11 +78,11 @@ for (const backend of backends) {
       assert.match(await screenOf(placement.pane), new RegExp(placement.marker));
     });
 
-    it("opens a new window in the caller session for new-window", async () => {
-      const placement = await place(env, "new-window");
+    it("opens a new window in the caller session for window", async () => {
+      const placement = await place(env, "window");
       createdPanes.push(placement.pane);
 
-      assert.equal(placement.target, "new-window");
+      assert.equal(placement.target, "window");
       assert.ok(placement.session, "expected a resolved session name");
       assert.match(await screenOf(placement.pane), new RegExp(placement.marker));
     });
@@ -100,25 +100,25 @@ for (const backend of backends) {
       assert.match(await screenOf(placement.pane), new RegExp(placement.marker));
     });
 
-    it("creates a detached session for NEW <name>", async () => {
+    it("creates a detached session for new-session:<name>", async () => {
       const session = `pi-test-new-${uniqueId()}`;
       createdSessions.push(session);
 
-      const placement = await place(env, `NEW ${session}`);
+      const placement = await place(env, `new-session:${session}`);
       createdPanes.push(placement.pane);
 
-      assert.equal(placement.target, `NEW ${session}`);
+      assert.equal(placement.target, `new-session:${session}`);
       assert.equal(placement.session, session);
       assert.match(await screenOf(placement.pane), new RegExp(placement.marker));
     });
 
-    it("reuses an existing session for a second NEW <name>", async () => {
+    it("reuses an existing session for a second new-session:<name>", async () => {
       const session = `pi-test-reuse-${uniqueId()}`;
       createdSessions.push(session);
 
-      const first = await place(env, `NEW ${session}`);
+      const first = await place(env, `new-session:${session}`);
       await sleep(500);
-      const second = await place(env, `NEW ${session}`);
+      const second = await place(env, `new-session:${session}`);
       createdPanes.push(first.pane, second.pane);
 
       assert.notEqual(first.pane, second.pane);

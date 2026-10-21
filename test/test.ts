@@ -33,6 +33,7 @@ import {
 import {
   shellEscape,
   parseSurfaceTarget,
+  surfaceTargetError,
   buildPlacementArgs,
   resumeSurfaceTarget,
   DEFAULT_EXIT_TIMEOUT_MS,
@@ -85,6 +86,48 @@ function withTempDir(run: (dir: string) => void) {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+/** Read the `--tools` value (single-quoted by shellEscape) out of launch parts. */
+function toolsValueFromParts(parts: string[]): string {
+  const idx = parts.indexOf("--tools");
+  assert.ok(idx >= 0, "expected --tools");
+  return parts[idx + 1].replace(/^'|'$/g, "");
+}
+
+/** Set lean-ctx env vars for one test, then restore them. */
+function withLeanCtxEnv(vars: Record<string, string | undefined>, run: () => void) {
+  const previous: Record<string, string | undefined> = {};
+  for (const name of Object.keys(vars)) previous[name] = process.env[name];
+  for (const [name, value] of Object.entries(vars)) restoreEnvVar(name, value);
+  try {
+    run();
+  } finally {
+    for (const [name, value] of Object.entries(previous)) restoreEnvVar(name, value);
+  }
+}
+
+/** Install a pi-lean-ctx loader stub (and optional config) into an agent dir. */
+function writeLeanCtxExtensionStub(agentDir: string, config?: object) {
+  const extDir = join(agentDir, "extensions", "pi-lean-ctx");
+  mkdirSync(extDir, { recursive: true });
+  writeFileSync(join(extDir, "index.ts"), "export default function () {}\n");
+  if (config) writeFileSync(join(extDir, "config.json"), JSON.stringify(config));
+}
+
+function sandboxLoadout(toolAllowlist: string): SubagentLoadout {
+  return {
+    agent: "test-echo",
+    toolAllowlist,
+    model: null,
+    thinking: null,
+    systemPromptMode: null,
+    identity: null,
+    spawnable: null,
+    autoExit: true,
+    cwd: null,
+    agentDir: null,
+  };
 }
 
 function createMockExtensionApi() {
@@ -390,7 +433,7 @@ describe("session.ts", () => {
 
     it("stores a peer placement and resolves its resume target", () => {
       const adir = join(dir, "art-peer");
-      const surface = { target: "NEW peers", session: "peers", pane: "%42" };
+      const surface = { target: "new-session:peers", session: "peers", pane: "%42" };
       registerName(adir, "peer-1", {
         sessionFile: "/s/peer.jsonl",
         sessionId: "id-peer",
@@ -398,7 +441,7 @@ describe("session.ts", () => {
       });
       const entry = resolveNameInRegistry(adir, "peer-1")!;
       assert.deepEqual(entry.surface, surface);
-      assert.equal(resumeSurfaceTarget(entry.surface), "NEW peers");
+      assert.equal(resumeSurfaceTarget(entry.surface), "new-session:peers");
     });
 
     it("keeps entries written before surface targeting resumable", () => {
@@ -1343,21 +1386,31 @@ describe("subagent discovery", () => {
   it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
     withTempDir((d) => {
       const parts: string[] = [];
-      testApi.applySandboxToParts(
-        parts,
+      // Lean-ctx off the loadout path: this test covers replay, not expansion.
+      withLeanCtxEnv(
         {
-          agent: "worker",
-          toolAllowlist: "read,write,safe_bash",
-          model: "openrouter/z-ai/glm-5.2",
-          thinking: "medium",
-          systemPromptMode: "append",
-          identity: "You are a worker.",
-          spawnable: ["scout"],
-          autoExit: true,
-          cwd: null,
-          agentDir: null,
+          LEAN_CTX_PI_MODE: undefined,
+          LEAN_CTX_PI_ROUTE_SHELL: undefined,
+          PI_CODING_AGENT_DIR: join(d, "agent-dir"),
         },
-        { artifactDir: d, name: "worker" },
+        () => {
+          testApi.applySandboxToParts(
+            parts,
+            {
+              agent: "worker",
+              toolAllowlist: "read,write,safe_bash",
+              model: "openrouter/z-ai/glm-5.2",
+              thinking: "medium",
+              systemPromptMode: "append",
+              identity: "You are a worker.",
+              spawnable: ["scout"],
+              autoExit: true,
+              cwd: null,
+              agentDir: null,
+            },
+            { artifactDir: d, name: "worker" },
+          );
+        },
       );
       const joined = parts.join(" ");
       // Model with thinking suffix.
@@ -1374,6 +1427,68 @@ describe("subagent discovery", () => {
         parts[toolsIdx + 1].includes("read,write,safe_bash"),
         "expected the tool allowlist as the --tools value",
       );
+    });
+  });
+
+  it("applySandboxToParts adds ctx_* substitutes for natives suppressed in replace mode", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeLeanCtxExtensionStub(globalDir, { mode: "replace" });
+      const parts: string[] = [];
+      withLeanCtxEnv({ LEAN_CTX_PI_MODE: undefined, LEAN_CTX_PI_ROUTE_SHELL: undefined }, () => {
+        testApi.applySandboxToParts(parts, sandboxLoadout("read,bash,write,edit,ask_question"), {
+          artifactDir: globalDir,
+          name: "test-echo",
+        });
+      });
+      const tools = toolsValueFromParts(parts).split(",");
+      assert.ok(tools.includes("bash"), "expected the native bash name to stay");
+      assert.ok(tools.includes("ctx_shell"), "expected ctx_shell next to bash");
+      assert.equal(
+        toolsValueFromParts(parts),
+        "read,ctx_read,bash,ctx_shell,write,edit,ask_question",
+        "expected each substitute directly after its native name",
+      );
+    });
+  });
+
+  it("applySandboxToParts leaves the allowlist untouched in additive mode", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeLeanCtxExtensionStub(globalDir);
+      const parts: string[] = [];
+      withLeanCtxEnv({ LEAN_CTX_PI_MODE: undefined, LEAN_CTX_PI_ROUTE_SHELL: undefined }, () => {
+        testApi.applySandboxToParts(parts, sandboxLoadout("read,bash"), {
+          artifactDir: globalDir,
+          name: "test-echo",
+        });
+      });
+      assert.equal(toolsValueFromParts(parts), "read,bash");
+    });
+  });
+
+  it("applySandboxToParts adds only ctx_shell in additive mode with routeShell", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeLeanCtxExtensionStub(globalDir, { mode: "additive", routeShell: true });
+      const parts: string[] = [];
+      withLeanCtxEnv({ LEAN_CTX_PI_MODE: undefined, LEAN_CTX_PI_ROUTE_SHELL: undefined }, () => {
+        testApi.applySandboxToParts(parts, sandboxLoadout("read,bash"), {
+          artifactDir: globalDir,
+          name: "test-echo",
+        });
+      });
+      assert.equal(toolsValueFromParts(parts), "read,bash,ctx_shell");
+    });
+  });
+
+  it("applySandboxToParts never adds ctx_* when pi-lean-ctx is not loaded", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      const parts: string[] = [];
+      withLeanCtxEnv({ LEAN_CTX_PI_MODE: "replace", LEAN_CTX_PI_ROUTE_SHELL: undefined }, () => {
+        testApi.applySandboxToParts(parts, sandboxLoadout("read,bash"), {
+          artifactDir: globalDir,
+          name: "test-echo",
+        });
+      });
+      assert.equal(toolsValueFromParts(parts), "read,bash");
     });
   });
 
@@ -2092,10 +2207,12 @@ describe("tool registration", () => {
     );
     // `name` is now optional and purely cosmetic.
     assert.match(props.name.description, /cosmetic/i);
-    // `surface` names the placement modes; the peer agent requires one.
-    assert.match(props.surface.description, /new-window/);
-    assert.match(props.surface.description, /NEW <name>/);
-    assert.match(props.surface.description, /peer/);
+    // `surface` names the placement modes; the agent's `surfaces` field limits them.
+    assert.match(props.surface.description, /new-session:<name>/);
+    assert.match(props.surface.description, /window:<session>/);
+    assert.match(props.surface.description, /pane/);
+    assert.match(props.surface.description, /surfaces/);
+    assert.doesNotMatch(props.surface.description, /new-window|NEW </);
     // `windowName` names the tmux window that a window-creating surface makes.
     assert.match(props.windowName.description, /window/);
     // The removed override knobs must be gone.
@@ -2127,7 +2244,7 @@ describe("tool registration", () => {
 
       const window = await subagentTool.execute(
         "call-2",
-        { agent: "solo", task: "do it", surface: "new-window", windowName: "recon" },
+        { agent: "solo", task: "do it", surface: "window", windowName: "recon" },
         undefined,
         undefined,
         {
@@ -2144,7 +2261,7 @@ describe("tool registration", () => {
     });
   });
 
-  it("rejects a pane surface for an agent whose frontmatter sets peer: true", async () => {
+  it("allows a pane spawn for an agent whose frontmatter sets peer: true", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
@@ -2157,42 +2274,59 @@ describe("tool registration", () => {
       const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
       assert.ok(subagentTool, "expected subagent tool to be registered");
 
-      const pane = await subagentTool.execute("call-1", { agent: "peer", task: "do it" });
-      assert.match(String(pane.details?.error), /explicit surface target/);
-      assert.match(String(pane.details?.error), /never runs in a pane/);
-
-      const explicit = await subagentTool.execute("call-2", {
-        agent: "peer",
-        task: "do it",
-        surface: "NEW peers",
-      }, undefined, undefined, {
-        // Stops right after the surface check, before any tmux launch.
-        sessionManager: { getSessionFile: () => null, getSessionId: () => "id", getSessionDir: () => tmpdir() },
-        cwd: tmpdir(),
-      } as any);
-      assert.doesNotMatch(String(explicit.details?.error ?? ""), /explicit surface target/);
+      const pane = await subagentTool.execute(
+        "call-1",
+        { agent: "peer", task: "do it" },
+        undefined,
+        undefined,
+        {
+          sessionManager: {
+            getSessionFile: () => null,
+            getSessionId: () => "id",
+            getSessionDir: () => tmpdir(),
+          },
+          cwd: tmpdir(),
+        } as any,
+      );
+      assert.doesNotMatch(String(pane.details?.error ?? ""), /cannot spawn as/);
+      assert.doesNotMatch(String(pane.details?.error ?? ""), /explicit surface target/);
     });
   });
 
-  it("gates peer behaviour on the frontmatter flag, not the agent name", async () => {
+  it("parses the surfaces field: comma list, brackets, dropped tokens", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.deepEqual(testApi.parseSurfaces(undefined), undefined);
+    assert.deepEqual(testApi.parseSurfaces("pane, window"), ["pane", "window"]);
+    assert.deepEqual(testApi.parseSurfaces("[window, session]"), ["window", "session"]);
+    assert.deepEqual(testApi.parseSurfaces("session, bogus, pane"), ["session", "pane"]);
+    assert.deepEqual(testApi.parseSurfaces("bogus, nope"), undefined);
+    assert.deepEqual(testApi.resolveAgentSurfaces(null), ["pane"]);
+    assert.deepEqual(testApi.resolveAgentSurfaces({ surfaces: ["session"] }), ["session"]);
+  });
+
+  it("maps surface arguments to policy kinds", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const kindOf = (raw?: string | null) => testApi.surfacePolicyKind(testApi.parseSurfaceTarget(raw));
+    assert.equal(kindOf(undefined), "pane");
+    assert.equal(kindOf("pane"), "pane");
+    assert.equal(kindOf("window"), "window");
+    assert.equal(kindOf("window:work"), "session");
+    assert.equal(kindOf("work"), "session");
+    assert.equal(kindOf("new-session:peer1"), "session");
+  });
+
+  it("rejects legacy and malformed surface values with a hard error", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-      // The `peer` name alone grants nothing.
       writeAgentFile(
         projectAgentsDir,
-        "peer",
-        ["name: peer", "description: Name only, no flag"].join("\n"),
-      );
-      writeAgentFile(
-        projectAgentsDir,
-        "flagged-peer-agent",
-        ["name: flagged-peer-agent", "description: Flag only", "peer: true"].join("\n"),
+        "solo",
+        ["name: solo", "description: Plain subagent", "surfaces: pane, window, session"].join("\n"),
       );
 
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
       const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
       assert.ok(subagentTool, "expected subagent tool to be registered");
-
       const ctx = {
         sessionManager: {
           getSessionFile: () => null,
@@ -2202,24 +2336,209 @@ describe("tool registration", () => {
         cwd: tmpdir(),
       } as any;
 
-      const byName = await subagentTool.execute(
-        "call-1",
-        { agent: "peer", task: "do it" },
-        undefined,
-        undefined,
-        ctx,
-      );
-      assert.doesNotMatch(String(byName.details?.error ?? ""), /explicit surface target/);
+      const cases: Array<[string, string]> = [
+        ["new-window", 'Invalid surface "new-window". Use "window".'],
+        ["NEW peer1", 'Invalid surface "NEW peer1". Use "new-session:peer1".'],
+        [
+          "window:",
+          'Invalid surface "window:". Use "pane", "window", "window:<session>", "new-session:<name>", or a bare tmux session name.',
+        ],
+        [
+          "foo:bar",
+          'Invalid surface "foo:bar". Use "pane", "window", "window:<session>", "new-session:<name>", or a bare tmux session name.',
+        ],
+      ];
 
-      const byFlag = await subagentTool.execute(
+      for (const [surface, expected] of cases) {
+        const result = await subagentTool.execute(
+          `call-${surface}`,
+          { agent: "solo", task: "do it", surface },
+          undefined,
+          undefined,
+          ctx,
+        );
+        assert.equal(result.details?.error, expected);
+        assert.equal(result.content?.[0]?.text, expected);
+      }
+    });
+  });
+
+  it("limits an agent with no surfaces field to pane", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "plain-surface-agent",
+        ["name: plain-surface-agent"].join("\n"),
+      );
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+      assert.ok(subagentTool, "expected subagent tool to be registered");
+
+      const rejected = await subagentTool.execute("call-1", {
+        agent: "plain-surface-agent",
+        task: "do it",
+        surface: "window",
+      });
+      assert.equal(
+        rejected.details?.error,
+        'The "plain-surface-agent" agent cannot spawn as "window". Allowed surfaces: pane.',
+      );
+
+      const allowed = await subagentTool.execute(
         "call-2",
-        { agent: "flagged-peer-agent", task: "do it" },
+        { agent: "plain-surface-agent", task: "do it" },
+        undefined,
+        undefined,
+        {
+          sessionManager: {
+            getSessionFile: () => null,
+            getSessionId: () => "id",
+            getSessionDir: () => tmpdir(),
+          },
+          cwd: tmpdir(),
+        } as any,
+      );
+      assert.doesNotMatch(String(allowed.details?.error ?? ""), /cannot spawn as/);
+    });
+  });
+
+  it("allows pane and window and rejects session for surfaces: pane, window", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "pane-window-agent",
+        ["name: pane-window-agent", "surfaces: pane, window"].join("\n"),
+      );
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+      assert.ok(subagentTool, "expected subagent tool to be registered");
+      const ctx = {
+        sessionManager: {
+          getSessionFile: () => null,
+          getSessionId: () => "id",
+          getSessionDir: () => tmpdir(),
+        },
+        cwd: tmpdir(),
+      } as any;
+
+      const pane = await subagentTool.execute(
+        "call-1",
+        { agent: "pane-window-agent", task: "do it" },
         undefined,
         undefined,
         ctx,
       );
-      assert.match(String(byFlag.details?.error), /explicit surface target/);
-      assert.match(String(byFlag.details?.error), /never runs in a pane/);
+      assert.doesNotMatch(String(pane.details?.error ?? ""), /cannot spawn as/);
+
+      const window = await subagentTool.execute(
+        "call-2",
+        { agent: "pane-window-agent", task: "do it", surface: "window" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.doesNotMatch(String(window.details?.error ?? ""), /cannot spawn as/);
+
+      const session = await subagentTool.execute(
+        "call-3",
+        { agent: "pane-window-agent", task: "do it", surface: "new-session:peer1" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal(
+        session.details?.error,
+        'The "pane-window-agent" agent cannot spawn as "session". Allowed surfaces: pane, window.',
+      );
+    });
+  });
+
+  it("accepts both session forms for surfaces: session", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "session-only-agent",
+        ["name: session-only-agent", "surfaces: session"].join("\n"),
+      );
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+      assert.ok(subagentTool, "expected subagent tool to be registered");
+      const ctx = {
+        sessionManager: {
+          getSessionFile: () => null,
+          getSessionId: () => "id",
+          getSessionDir: () => tmpdir(),
+        },
+        cwd: tmpdir(),
+      } as any;
+
+      for (const surface of ["work", "new-session:peer1"]) {
+        const result = await subagentTool.execute(
+          "call",
+          { agent: "session-only-agent", task: "do it", surface },
+          undefined,
+          undefined,
+          ctx,
+        );
+        assert.doesNotMatch(String(result.details?.error ?? ""), /cannot spawn as/);
+      }
+    });
+  });
+
+  it("falls back to pane when every surfaces token is invalid", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "invalid-surfaces-agent",
+        ["name: invalid-surfaces-agent", "surfaces: bogus, nope"].join("\n"),
+      );
+
+      const testApi = (subagentsModule as any).__test__;
+      const loaded = testApi.loadAgentDefaults("invalid-surfaces-agent");
+      assert.equal(loaded.surfaces, undefined);
+      assert.deepEqual(testApi.resolveAgentSurfaces(loaded), ["pane"]);
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+      assert.ok(subagentTool, "expected subagent tool to be registered");
+
+      const session = await subagentTool.execute("call-1", {
+        agent: "invalid-surfaces-agent",
+        task: "do it",
+        surface: "work",
+      });
+      assert.equal(
+        session.details?.error,
+        'The "invalid-surfaces-agent" agent cannot spawn as "session". Allowed surfaces: pane.',
+      );
+    });
+  });
+
+  it("resumes a peer as a pane when no placement was recorded", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "peer",
+        ["name: peer", "description: Full pi peer", "peer: true"].join("\n"),
+      );
+
+      const testApi = (subagentsModule as any).__test__;
+      // No resume-time peer refusal: no recorded surface → pane placement.
+      assert.equal(testApi.resolveResumeSurface(undefined), undefined);
+      assert.equal(testApi.resolveResumeSurface(null), undefined);
+      assert.deepEqual(testApi.resolveAgentSurfaces(testApi.loadAgentDefaults("peer")), ["pane"]);
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+      assert.ok(messageTool, "expected subagent_message tool to be registered");
     });
   });
 
@@ -3027,61 +3346,121 @@ describe("tmux.ts", () => {
     it("defaults to a pane split", () => {
       assert.deepEqual(parseSurfaceTarget(undefined), { kind: "pane" });
       assert.deepEqual(parseSurfaceTarget("   "), { kind: "pane" });
+      assert.deepEqual(parseSurfaceTarget("pane"), { kind: "pane" });
     });
 
-    it("maps new-window to a window in the caller session", () => {
-      assert.deepEqual(parseSurfaceTarget("new-window"), { kind: "window" });
+    it("maps window to a window in the caller session", () => {
+      assert.deepEqual(parseSurfaceTarget("window"), { kind: "window" });
     });
 
-    it("treats any other value as an existing session name", () => {
+    it("parses window:<session> into a window in that session", () => {
+      assert.deepEqual(parseSurfaceTarget("window:work"), { kind: "session", session: "work" });
+    });
+
+    it("treats any other bare value as an existing session name", () => {
       assert.deepEqual(parseSurfaceTarget("tickets"), { kind: "session", session: "tickets" });
+      assert.deepEqual(parseSurfaceTarget("work"), { kind: "session", session: "work" });
     });
 
-    it("parses NEW <name> into a detached new session", () => {
-      assert.deepEqual(parseSurfaceTarget("NEW tickets"), {
+    it("parses new-session:<name> into a detached new session", () => {
+      assert.deepEqual(parseSurfaceTarget("new-session:tickets"), {
         kind: "new-session",
         session: "tickets",
       });
-      assert.deepEqual(parseSurfaceTarget("  NEW  my session "), {
+      assert.deepEqual(parseSurfaceTarget("  new-session:my session "), {
         kind: "new-session",
         session: "my session",
       });
     });
+
+    it("rejects invalid values", () => {
+      for (const raw of ["new-window", "NEW peer1", "window:", "new-session:", "foo:bar"]) {
+        assert.equal(parseSurfaceTarget(raw), null, `${raw} must be invalid`);
+      }
+    });
+  });
+
+  describe("surfaceTargetError", () => {
+    it("points each legacy value at its replacement", () => {
+      assert.equal(surfaceTargetError("new-window"), 'Invalid surface "new-window". Use "window".');
+      assert.equal(
+        surfaceTargetError("NEW peer1"),
+        'Invalid surface "NEW peer1". Use "new-session:peer1".',
+      );
+    });
+
+    it("lists the grammar for any other invalid value", () => {
+      const expected =
+        'Invalid surface "foo:bar". Use "pane", "window", "window:<session>", ' +
+        '"new-session:<name>", or a bare tmux session name.';
+      assert.equal(surfaceTargetError("foo:bar"), expected);
+      assert.equal(surfaceTargetError("window:"), 'Invalid surface "window:". ' + expected.slice('Invalid surface "foo:bar". '.length));
+    });
   });
 
   describe("buildPlacementArgs", () => {
-    it("creates a detached window in the caller session for new-window", () => {
-      const args = buildPlacementArgs(parseSurfaceTarget("new-window"), "/tmp/launch.sh", undefined, true);
+    it("creates a detached window in the caller session for window", () => {
+      const args = buildPlacementArgs(
+        parseSurfaceTarget("window")!,
+        "/tmp/launch.sh",
+        undefined,
+        true,
+      );
       assert.equal(args[0], "new-window");
       assert.equal(args[1], "-d");
-      assert.ok(!args.includes("-t"), "new-window must not name a session");
+      assert.ok(!args.includes("-t"), "window must not name a session");
       assert.equal(args.at(-1), `bash ${shellEscape("/tmp/launch.sh")}`);
       assert.ok(args.includes("#{pane_id}"), "placement must resolve the new pane id");
     });
 
     it("targets the named session for an existing session name", () => {
-      const args = buildPlacementArgs(parseSurfaceTarget("tickets"), "/tmp/launch.sh", "/work", true);
+      const args = buildPlacementArgs(
+        parseSurfaceTarget("tickets")!,
+        "/tmp/launch.sh",
+        "/work",
+        true,
+      );
       assert.deepEqual(args.slice(0, 4), ["new-window", "-d", "-t", "tickets:"]);
       assert.deepEqual(args.slice(4, 6), ["-P", "-F"]);
       assert.ok(args.includes("-c"));
       assert.ok(args.includes("/work"));
     });
 
+    it("targets the named session for window:<session>", () => {
+      const args = buildPlacementArgs(
+        parseSurfaceTarget("window:tickets")!,
+        "/tmp/launch.sh",
+        undefined,
+        true,
+      );
+      assert.deepEqual(args.slice(0, 4), ["new-window", "-d", "-t", "tickets:"]);
+    });
+
     it("creates a detached new session when the name is free", () => {
-      const args = buildPlacementArgs(parseSurfaceTarget("NEW peers"), "/tmp/launch.sh", undefined, false);
+      const args = buildPlacementArgs(
+        parseSurfaceTarget("new-session:peers")!,
+        "/tmp/launch.sh",
+        undefined,
+        false,
+      );
       assert.deepEqual(args.slice(0, 4), ["new-session", "-d", "-s", "peers"]);
       assert.equal(args.at(-1), `bash ${shellEscape("/tmp/launch.sh")}`);
     });
 
     it("reopens a live session as a window instead of failing", () => {
-      const args = buildPlacementArgs(parseSurfaceTarget("NEW peers"), "/tmp/launch.sh", undefined, true);
+      const args = buildPlacementArgs(
+        parseSurfaceTarget("new-session:peers")!,
+        "/tmp/launch.sh",
+        undefined,
+        true,
+      );
       assert.equal(args[0], "new-window");
       assert.ok(args.includes("peers:"));
     });
 
-    it("names the window for new-window", () => {
+    it("names the window for window", () => {
       const args = buildPlacementArgs(
-        parseSurfaceTarget("new-window"),
+        parseSurfaceTarget("window")!,
         "/tmp/launch.sh",
         undefined,
         true,
@@ -3093,7 +3472,7 @@ describe("tmux.ts", () => {
 
     it("names the window after the session target for a named session", () => {
       const args = buildPlacementArgs(
-        parseSurfaceTarget("tickets"),
+        parseSurfaceTarget("tickets")!,
         "/tmp/launch.sh",
         undefined,
         true,
@@ -3104,7 +3483,7 @@ describe("tmux.ts", () => {
 
     it("names the first window of a freshly created session", () => {
       const args = buildPlacementArgs(
-        parseSurfaceTarget("NEW peers"),
+        parseSurfaceTarget("new-session:peers")!,
         "/tmp/launch.sh",
         undefined,
         false,
@@ -3115,7 +3494,7 @@ describe("tmux.ts", () => {
 
     it("names the window when a new-session target falls back to its live session", () => {
       const args = buildPlacementArgs(
-        parseSurfaceTarget("NEW peers"),
+        parseSurfaceTarget("new-session:peers")!,
         "/tmp/launch.sh",
         undefined,
         true,
@@ -3125,10 +3504,10 @@ describe("tmux.ts", () => {
     });
 
     it("adds no -n when no window name is given", () => {
-      for (const raw of ["new-window", "tickets", "NEW peers"]) {
+      for (const raw of ["window", "window:tickets", "tickets", "new-session:peers"]) {
         for (const sessionExists of [true, false]) {
           const args = buildPlacementArgs(
-            parseSurfaceTarget(raw),
+            parseSurfaceTarget(raw)!,
             "/tmp/launch.sh",
             undefined,
             sessionExists,
@@ -3145,17 +3524,24 @@ describe("tmux.ts", () => {
       assert.equal(resumeSurfaceTarget(null), undefined);
     });
 
-    it("reopens the recorded session, even for a new-window spawn", () => {
+    it("reopens the recorded session as a new-session target", () => {
       assert.equal(
-        resumeSurfaceTarget({ target: "new-window", session: "work" }),
-        "NEW work",
+        resumeSurfaceTarget({ target: "window", session: "work" }),
+        "new-session:work",
+      );
+    });
+
+    it("replays a recorded new-session placement", () => {
+      assert.equal(
+        resumeSurfaceTarget({ target: "new-session:peer1", session: "peer1" }),
+        "new-session:peer1",
       );
     });
 
     it("replays the recorded target when the session is unknown", () => {
       assert.equal(
-        resumeSurfaceTarget({ target: "NEW peers", session: null }),
-        "NEW peers",
+        resumeSurfaceTarget({ target: "new-session:peers", session: null }),
+        "new-session:peers",
       );
       assert.equal(resumeSurfaceTarget({ target: null, session: null }), undefined);
     });

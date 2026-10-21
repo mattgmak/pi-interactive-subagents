@@ -194,19 +194,43 @@ export interface SurfaceTarget {
 }
 
 /**
- * Parse the `surface` spawn argument:
- * - omitted → `pane` (split beside the caller, existing behavior)
- * - `new-window` → new window in the caller's tmux session
- * - any other name → new window in that existing tmux session
- * - `NEW <name>` → detached new session named `<name>`
+ * Parse the `surface` spawn argument, or null when the value is invalid:
+ * - omitted, empty, or `pane` → split beside the caller
+ * - `window` → new window in the caller's tmux session
+ * - `window:<session>` → new window inside that existing tmux session
+ * - `new-session:<name>` → detached new session named `<name>`
+ * - any other bare token → new window inside that existing tmux session
+ *
+ * A colon is reserved for the known prefixes, so a tmux session name must not
+ * hold one. The legacy values `new-window` and `NEW <name>` are rejected.
  */
-export function parseSurfaceTarget(raw?: string | null): SurfaceTarget {
+export function parseSurfaceTarget(raw?: string | null): SurfaceTarget | null {
   const value = raw?.trim();
-  if (!value) return { kind: "pane" };
-  if (value === "new-window") return { kind: "window" };
-  const detached = value.match(/^NEW\s+(.+)$/);
-  if (detached) return { kind: "new-session", session: detached[1].trim() };
+  if (!value || value === "pane") return { kind: "pane" };
+  if (value === "window") return { kind: "window" };
+  if (value === "new-window" || /^NEW\s/.test(value)) return null;
+  if (value.startsWith("new-session:")) {
+    const session = value.slice("new-session:".length).trim();
+    return session ? { kind: "new-session", session } : null;
+  }
+  if (value.startsWith("window:")) {
+    const session = value.slice("window:".length).trim();
+    return session ? { kind: "session", session } : null;
+  }
+  if (value.includes(":")) return null;
   return { kind: "session", session: value };
+}
+
+/** Rejection text for an invalid `surface` spawn argument. */
+export function surfaceTargetError(raw?: string | null): string {
+  const value = raw?.trim() ?? "";
+  if (value === "new-window") return 'Invalid surface "new-window". Use "window".';
+  const legacy = value.match(/^NEW\s+(.+)$/);
+  if (legacy) return `Invalid surface "${value}". Use "new-session:${legacy[1].trim()}".`;
+  return (
+    `Invalid surface "${value}". Use "pane", "window", "window:<session>", ` +
+    `"new-session:<name>", or a bare tmux session name.`
+  );
 }
 
 /** Resolved placement of a launched subagent surface. */
@@ -245,7 +269,7 @@ function tmuxSessionExists(name: string): boolean {
 /**
  * tmux argv that creates the surface for a parsed non-pane target. `pane` is
  * handled by `launchSurface` and never reaches here. A `new-session` target
- * falls back to a window when the session already exists, so `NEW <name>`
+ * falls back to a window when the session already exists, so `new-session:<name>`
  * reopens a live session instead of failing. `windowName` names that window.
  */
 export function buildPlacementArgs(
@@ -274,14 +298,15 @@ export function buildPlacementArgs(
 
 /**
  * `surface` argument that relaunches a recorded placement. A recorded session
- * wins: `NEW <session>` reopens it, or recreates it if it is gone. Otherwise
- * the original argument is replayed. `undefined` means no placement recorded.
+ * wins: `new-session:<session>` reopens it, or recreates it if it is gone.
+ * Otherwise the original argument is replayed. `undefined` means no placement
+ * recorded.
  */
 export function resumeSurfaceTarget(
   surface?: { target: string | null; session: string | null } | null,
 ): string | undefined {
   if (!surface) return undefined;
-  if (surface.session) return `NEW ${surface.session}`;
+  if (surface.session) return `new-session:${surface.session}`;
   return surface.target ?? undefined;
 }
 
@@ -298,6 +323,8 @@ export function launchSurfaceAt(
   windowName?: string,
 ): SurfacePlacement {
   const target = parseSurfaceTarget(raw);
+  // The spawn handler validates first, so an invalid value here is a bug.
+  if (!target) throw new Error(surfaceTargetError(raw));
   if (target.kind === "pane") {
     const pane = launchSurface(name, scriptPath, cwd);
     return { target: raw?.trim() || null, session: sessionNameFor(pane), pane };

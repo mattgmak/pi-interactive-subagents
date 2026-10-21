@@ -17,11 +17,12 @@ import {
   rmSync,
   existsSync,
   readFileSync,
+  writeFileSync,
   unlinkSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import {
   isMuxAvailable,
   createSurface,
@@ -67,8 +68,32 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
 
 // ── Configuration ──
 
-/** Model used for integration tests. Override with PI_TEST_MODEL env var. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "anthropic/claude-haiku-4-5";
+/**
+ * Resolve the model for the LLM integration tests.
+ *
+ * Order: `PI_TEST_MODEL`, then `defaultModel` from the host pi settings file,
+ * then null. A missing file, bad JSON, or a non-string value counts as absent.
+ */
+export function resolveTestModel(): string | null {
+  const fromEnv = process.env.PI_TEST_MODEL?.trim();
+  if (fromEnv) return fromEnv;
+
+  const agentDir = process.env.PI_CODING_AGENT_DIR;
+  const settingsPath = join(agentDir || join(homedir(), ".pi", "agent"), "settings.json");
+
+  try {
+    const value = JSON.parse(readFileSync(settingsPath, "utf8"))?.defaultModel;
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Model resolved for the integration tests, or null when none resolves. */
+export const TEST_MODEL: string | null = resolveTestModel();
+
+/** Skip reason for the LLM integration suite when no model resolves. */
+export const NO_MODEL_SKIP_REASON = "set PI_TEST_MODEL to run the LLM integration suite";
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
@@ -139,12 +164,25 @@ export function createTestEnv(): TestEnv {
   if (existsSync(TEST_AGENTS_SRC)) {
     for (const file of readdirSync(TEST_AGENTS_SRC)) {
       if (file.endsWith(".md")) {
-        cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
+        const dest = join(agentsDir, file);
+        cpSync(join(TEST_AGENTS_SRC, file), dest);
+        if (TEST_MODEL) injectModel(dest, TEST_MODEL);
       }
     }
   }
 
   return { dir, surfaces: [], tempFiles: [] };
+}
+
+/**
+ * Write the resolved model into a copied fixture's frontmatter.
+ * The repo fixtures stay provider-neutral, so the line comes from here.
+ */
+function injectModel(file: string, model: string): void {
+  const source = readFileSync(file, "utf8");
+  const header = source.match(/^---\r?\n/);
+  if (!header) return;
+  writeFileSync(file, `${header[0]}model: ${model}\n${source.slice(header[0].length)}`);
 }
 
 /**
@@ -220,7 +258,7 @@ export function startPi(
     `pi`,
     `-ne`,
     `-e ${shellEscape(EXTENSION_SOURCE)}`,
-    `--model ${shellEscape(model)}`,
+    model ? `--model ${shellEscape(model)}` : "",
     extra,
     shellEscape(task),
   ]

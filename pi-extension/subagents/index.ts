@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -19,8 +19,10 @@ import {
   muxSetupHint,
   launchSurfaceAt,
   parseSurfaceTarget,
+  surfaceTargetError,
   resumeSurfaceTarget,
   type SurfacePlacement,
+  type SurfaceTarget,
   sendCommand,
   pollForExit,
   closeSurface,
@@ -150,15 +152,17 @@ const SubagentParams = Type.Object({
         "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
     }),
   ),
-  // Where the pane goes: omitted = split beside you; "new-window" = new window
-  // in your tmux session; "<session>" = new window in that session;
-  // "NEW <name>" = detached new session. Required for agents with `peer: true`.
+  // Where the pane goes: omitted or "pane" = split beside you; "window" = new
+  // window in your tmux session; "window:<session>" = new window there;
+  // "new-session:<name>" = detached new session; a bare name = new window in
+  // that existing session. An agent's `surfaces` frontmatter limits the modes.
   surface: Type.Optional(
     Type.String({
       description:
-        'Where to launch the pane. Omitted: split beside you. "new-window": new window in your tmux session. ' +
-        'An existing tmux session name: new window there. "NEW <name>": detached new session. ' +
-        'An agent with `peer: true` in its frontmatter requires one of the non-pane values.',
+        'Where to launch the pane. Omitted or "pane": split beside you. "window": new window in ' +
+        'your tmux session. "window:<session>": new window in that existing session. ' +
+        '"new-session:<name>": detached new session. A bare tmux session name: new window there. ' +
+        'An agent restricts these modes with its `surfaces` frontmatter field.',
     }),
   ),
   // Names the tmux window for the three window-creating surface kinds. A pane
@@ -172,6 +176,11 @@ const SubagentParams = Type.Object({
 });
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
+
+/** Spawn placement kinds an agent can allow via the `surfaces` field. */
+type AgentSurface = "pane" | "window" | "session";
+
+const AGENT_SURFACES: readonly AgentSurface[] = ["pane", "window", "session"];
 
 interface AgentDefaults {
   model?: string;
@@ -194,10 +203,12 @@ interface AgentDefaults {
   body?: string;
   disableModelInvocation?: boolean;
   /**
-   * Cross-session peer rights: this agent always launches outside the caller's
-   * pane and must name an explicit non-pane `surface`. Absent → false.
+   * Cross-session peer rights: shared name registry, pi-agent-sesh extension,
+   * peer launch scripts, and `--name`. Absent → false.
    */
   peer?: boolean;
+  /** Spawn surfaces this agent allows. Absent or fully invalid → `pane` only. */
+  surfaces?: AgentSurface[];
 }
 
 type AgentSource = "package" | "global" | "project";
@@ -227,13 +238,33 @@ const SPAWNING_TOOLS = [
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
 
 /**
- * Peer agents launch outside the caller's pane and must name an explicit
- * `surface` target. The flag is frontmatter-driven (`peer: true`), so any agent
- * can opt in regardless of its name.
+ * Peer agents get cross-session rights (shared registry, pi-agent-sesh, peer
+ * scripts, `--name`). The flag is frontmatter-driven (`peer: true`), so any
+ * agent can opt in regardless of its name.
  */
 function isPeerAgent(agent: string | null | undefined): boolean {
   if (!agent) return false;
   return loadAgentDefaults(agent)?.peer ?? false;
+}
+
+/** Allowed surfaces for an agent. Missing or fully invalid `surfaces` → pane only. */
+function resolveAgentSurfaces(agentDefs: AgentDefaults | null | undefined): AgentSurface[] {
+  return agentDefs?.surfaces ?? ["pane"];
+}
+
+/** Map a parsed `surface` target to the policy kind it requires. */
+function surfacePolicyKind(target: SurfaceTarget): AgentSurface {
+  return target.kind === "new-session" ? "session" : target.kind;
+}
+
+/** Rejection text for a disallowed spawn surface, or undefined when allowed. */
+function surfacePolicyViolation(
+  agent: string,
+  requested: AgentSurface,
+  allowed: AgentSurface[],
+): string | undefined {
+  if (allowed.includes(requested)) return undefined;
+  return `The "${agent}" agent cannot spawn as "${requested}". Allowed surfaces: ${allowed.join(", ")}.`;
 }
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
@@ -337,6 +368,22 @@ function parseCommaList(value: string | undefined): string[] | undefined {
   return list.length > 0 ? list : undefined;
 }
 
+/**
+ * Parse the `surfaces` field: comma list, optional flow-style brackets.
+ * Unknown tokens are dropped. No valid token → undefined (caller defaults to pane).
+ */
+function parseSurfaces(value: string | undefined): AgentSurface[] | undefined {
+  if (value == null) return undefined;
+  const list = value
+    .replace(/^\s*\[|\]\s*$/g, "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((token): token is AgentSurface =>
+      (AGENT_SURFACES as readonly string[]).includes(token),
+    );
+  return list.length > 0 ? [...new Set(list)] : undefined;
+}
+
 function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
   if (value === "standalone" || value === "lineage-only" || value === "fork") {
     return value;
@@ -375,6 +422,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     disableModelInvocation:
       getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
     peer: parseOptionalBoolean(getFrontmatterValue(frontmatter, "peer")) ?? false,
+    surfaces: parseSurfaces(getFrontmatterValue(frontmatter, "surfaces")),
   };
 }
 
@@ -980,6 +1028,90 @@ function getSpawningExtensionPath(): string | undefined {
   return getCuratedExtensionPath("pi-interactive-subagents");
 }
 
+const LEAN_CTX_LOADER_NAME = "pi-lean-ctx";
+
+/**
+ * Native builtins pi-lean-ctx can suppress, mapped to the compressed tools it
+ * registers in their place. A child `--tools` allowlist names the natives, so a
+ * `replace`-mode child would launch without any read/shell tool at all.
+ */
+const LEAN_CTX_TOOL_SUBSTITUTES: Record<string, string> = {
+  read: "ctx_read",
+  bash: "ctx_shell",
+  ls: "ctx_ls",
+  find: "ctx_find",
+  grep: "ctx_grep",
+};
+
+/** lean-ctx's own truthiness test for `LEAN_CTX_PI_*` flags. */
+function leanCtxEnvFlag(name: string): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+/** lean-ctx's per-extension config file, honouring PI_CODING_AGENT_DIR. */
+function leanCtxConfigPath(): string {
+  return join(getAgentConfigDir(), "extensions", LEAN_CTX_LOADER_NAME, "config.json");
+}
+
+/**
+ * Native builtins lean-ctx suppresses for the current configuration. Mirrors
+ * lean-ctx's own resolution order: env var, then config file, then default.
+ * A missing or unreadable config reads as `additive` without routeShell.
+ */
+function resolveLeanCtxSuppressedBuiltins(): Set<string> {
+  let fileMode: string | undefined;
+  let fileRouteShell: unknown;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(leanCtxConfigPath(), "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const cfg = parsed as { mode?: unknown; routeShell?: unknown };
+      fileMode = typeof cfg.mode === "string" ? cfg.mode : undefined;
+      fileRouteShell = cfg.routeShell;
+    }
+  } catch {
+    // Absent or malformed config: lean-ctx keeps its non-regressive defaults.
+  }
+
+  const mode = (process.env.LEAN_CTX_PI_MODE ?? fileMode ?? "additive").toLowerCase();
+  if (mode === "replace") return new Set(Object.keys(LEAN_CTX_TOOL_SUBSTITUTES));
+
+  const routeShell =
+    process.env.LEAN_CTX_PI_ROUTE_SHELL !== undefined
+      ? leanCtxEnvFlag("LEAN_CTX_PI_ROUTE_SHELL")
+      : fileRouteShell === true;
+  return routeShell ? new Set(["bash"]) : new Set<string>();
+}
+
+/** True when the loadout's `-e` list loads the lean-ctx loader. */
+function hasLeanCtxExtension(extPaths: Set<string>): boolean {
+  for (const extPath of extPaths) {
+    if (basename(dirname(extPath)) === LEAN_CTX_LOADER_NAME) return true;
+  }
+  return false;
+}
+
+/**
+ * Append the lean-ctx substitute for every suppressed native builtin in a child
+ * `--tools` value. Native names stay, so the allowlist still works without
+ * lean-ctx; each substitute lands directly after the name it replaces.
+ */
+function expandLeanCtxToolAllowlist(toolAllowlist: string, extPaths: Set<string>): string {
+  if (!hasLeanCtxExtension(extPaths)) return toolAllowlist;
+  const suppressed = resolveLeanCtxSuppressedBuiltins();
+  if (suppressed.size === 0) return toolAllowlist;
+
+  const expanded: string[] = [];
+  for (const tool of toolAllowlist.split(",")) {
+    const trimmed = tool.trim();
+    if (!trimmed) continue;
+    if (!expanded.includes(trimmed)) expanded.push(trimmed);
+    const substitute = suppressed.has(trimmed) ? LEAN_CTX_TOOL_SUBSTITUTES[trimmed] : undefined;
+    if (substitute && !expanded.includes(substitute)) expanded.push(substitute);
+  }
+  return expanded.join(",");
+}
+
 /** All `-e` extension paths for a restricted subagent loadout. */
 function collectSubagentExtensionPaths(loadout: SubagentLoadout): Set<string> {
   const extPaths = new Set<string>();
@@ -1051,10 +1183,12 @@ function applySandboxToParts(
   // extensions backing the whitelisted tools. A null allowlist means the spawn
   // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
   if (loadout.toolAllowlist) {
+    const extPaths = collectSubagentExtensionPaths(loadout);
+    const toolAllowlist = expandLeanCtxToolAllowlist(loadout.toolAllowlist, extPaths);
     parts.push("--no-extensions");
-    parts.push("--tools", shellEscape(loadout.toolAllowlist));
+    parts.push("--tools", shellEscape(toolAllowlist));
 
-    for (const extPath of collectSubagentExtensionPaths(loadout)) {
+    for (const extPath of extPaths) {
       parts.push("-e", shellEscape(extPath));
     }
   }
@@ -1316,6 +1450,11 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
   return { autoExit: true, interactive: false };
 }
 
+/** Resume placement argument. No recorded surface resumes as a pane for every agent. */
+function resolveResumeSurface(surface: SurfacePlacement | null | undefined): string | undefined {
+  return resumeSurfaceTarget(surface);
+}
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -1346,6 +1485,13 @@ export const __test__ = {
   handleSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  resolveResumeSurface,
+  parseSurfaces,
+  parseSurfaceTarget,
+  surfaceTargetError,
+  resolveAgentSurfaces,
+  surfacePolicyKind,
+  surfacePolicyViolation,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -2017,24 +2163,40 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // A window name needs a window. A pane split reuses the caller's
-        // window, so naming one there has no target.
-        if (params.windowName?.trim() && parseSurfaceTarget(params.surface).kind === "pane") {
-          const err =
-            `A window name needs a window-creating surface target: "new-window", an existing tmux ` +
-            `session name, or "NEW <name>". A pane split has no window of its own.`;
+        // The `surface` value decides every placement rule below, so validate
+        // it first. A null parse means the value is not part of the grammar.
+        const surfaceTarget = parseSurfaceTarget(params.surface);
+        if (!surfaceTarget) {
+          const err = surfaceTargetError(params.surface);
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
-        // A peer never shares the caller's window: it needs an explicit
-        // non-pane `surface` target, so it can never land as a pane beside you.
-        const peer = isPeerAgent(params.agent);
-        if (peer && parseSurfaceTarget(params.surface).kind === "pane") {
+        // A window name needs a window. A pane split reuses the caller's
+        // window, so naming one there has no target.
+        if (params.windowName?.trim() && surfaceTarget.kind === "pane") {
           const err =
-            `The "${params.agent}" agent is a peer and needs an explicit surface target: "new-window", ` +
-            `an existing tmux session name, or "NEW <name>". A peer never runs in a pane beside you.`;
+            `A window name needs a window-creating surface target: "window", ` +
+            `"window:<session>", "new-session:<name>", or a bare tmux session name. ` +
+            `A pane split has no window of its own.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
+
+        // The agent's `surfaces` frontmatter limits the placement it may take.
+        const allowedSurfaces = resolveAgentSurfaces(loadAgentDefaults(params.agent));
+        const requestedKind = surfacePolicyKind(surfaceTarget);
+        const surfaceViolation = surfacePolicyViolation(
+          params.agent,
+          requestedKind,
+          allowedSurfaces,
+        );
+        if (surfaceViolation) {
+          return {
+            content: [{ type: "text" as const, text: surfaceViolation }],
+            details: { error: surfaceViolation },
+          };
+        }
+
+        const peer = isPeerAgent(params.agent);
 
         // Validate prerequisites (need mux + a session file to derive the
         // artifact dir that hosts this session's name registry).
@@ -2447,20 +2609,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Surface is placed below, after the resume script is written —
         // command-form spawn (`bash <script>` as pane program), no typed
         // input, no shell-init race. A recorded placement relaunches into the
-        // same tmux session: `NEW <name>` reopens it, or recreates it if gone.
-        const resumeTarget = resumeSurfaceTarget(entry.surface);
+        // same tmux session: `new-session:<name>` reopens it, or recreates it if gone.
+        // Recorded placement only: a missing one resumes as a pane, peer or not.
+        const resumeTarget = resolveResumeSurface(entry.surface);
 
         // The peer flag is snapshotted, so a later frontmatter edit cannot
         // change how an existing session resumes.
         const peer = loadout.peer ?? isPeerAgent(loadout.agent);
-
-        // A peer never returns to a pane, so a missing placement is a hard stop.
-        if (peer && !resumeTarget) {
-          const err =
-            `Cannot resume peer "${requestedName}": its launch surface was never recorded. ` +
-            `Spawn a fresh peer with an explicit surface target instead.`;
-          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
-        }
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(sessionPath)];
