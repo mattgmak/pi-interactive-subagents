@@ -28,6 +28,7 @@ import {
   pollForExit,
   closeSurface,
   isSurfaceAlive,
+  type SurfaceLiveness,
   shellEscape,
   readScreen,
   writeLaunchScript,
@@ -796,6 +797,8 @@ interface RunningSubagent {
   interactive: boolean;
   /** When the proven-launch sentinel appeared. Gates the liveness reaper. */
   startSentinelAt?: number;
+  /** Consecutive reaper ticks that saw the surface not alive. */
+  deadTicks?: number;
   /** Set by the stop path so the watcher stays silent about this run. */
   stopCause?: StopCause;
 }
@@ -1425,6 +1428,9 @@ export const REAP_GRACE_MS = 25_000;
 /** Module interval that probes every running pane. */
 export const REAP_INTERVAL_MS = 10_000;
 
+/** Dead ticks in a row before a surface is reaped. */
+export const REAP_DEAD_TICKS = 3;
+
 /** DONE sentinel. A pane that shows it is finished, and the watcher closes it. */
 const DONE_SENTINEL_RE = /__SUBAGENT_DONE_\d+__/;
 
@@ -1453,18 +1459,18 @@ function stopRunningSubagent(
 }
 
 /**
- * Reap decision. A pane is never reaped before its start sentinel appeared and
- * never inside the grace window, because a pane that has not printed the
- * sentinel may still be starting pi.
+ * Reap decision before the sustained-death counter. A pane is never reaped
+ * before its start sentinel appeared and never inside the grace window, because
+ * a pane that has not printed the sentinel may still be starting pi.
  */
 export function shouldReapSubagent(
   running: Pick<RunningSubagent, "surface" | "startSentinelAt">,
   now: number,
-  alive: (surface: string) => boolean = isSurfaceAlive,
+  alive: boolean,
 ): boolean {
   if (!running.startSentinelAt) return false;
   if (now - running.startSentinelAt < REAP_GRACE_MS) return false;
-  return !alive(running.surface);
+  return !alive;
 }
 
 function paneShowsDone(surface: string): boolean {
@@ -1478,15 +1484,38 @@ function paneShowsDone(surface: string): boolean {
 /** One reaper pass. Returns the rows it removed. */
 export function reapDeadSubagents(
   now: number,
-  deps: { alive?: (surface: string) => boolean; showsDone?: (surface: string) => boolean } = {},
+  deps: {
+    alive?: (surface: string) => SurfaceLiveness;
+    showsDone?: (surface: string) => boolean;
+  } = {},
 ): RunningSubagent[] {
-  const alive = deps.alive ?? isSurfaceAlive;
+  const probe = deps.alive ?? isSurfaceAlive;
   const showsDone = deps.showsDone ?? paneShowsDone;
   const reaped: RunningSubagent[] = [];
 
   for (const running of [...runningSubagents.values()]) {
-    if (!shouldReapSubagent(running, now, alive)) continue;
-    if (showsDone(running.surface)) continue;
+    if (!running.startSentinelAt) {
+      running.deadTicks = 0;
+      continue;
+    }
+    if (now - running.startSentinelAt < REAP_GRACE_MS) {
+      running.deadTicks = 0;
+      continue;
+    }
+    if (showsDone(running.surface)) {
+      running.deadTicks = 0;
+      continue;
+    }
+
+    const result = probe(running.surface);
+    if (result.alive) {
+      running.deadTicks = 0;
+      continue;
+    }
+
+    running.deadTicks = (running.deadTicks ?? 0) + 1;
+    if (running.deadTicks < REAP_DEAD_TICKS) continue;
+
     stopRunningSubagent(running, "reap");
     reaped.push(running);
 
@@ -1732,6 +1761,7 @@ export const __test__ = {
   createStopAutocompleteProvider,
   REAP_GRACE_MS,
   REAP_INTERVAL_MS,
+  REAP_DEAD_TICKS,
   formatElapsed,
   formatTokens,
   formatContextUsage,

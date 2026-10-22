@@ -415,13 +415,18 @@ function paneIsShellSync(surface: string): boolean {
 
 // ── Liveness probe ──
 
-/** Processes a live subagent pane runs: the pi CLI under any of its names. */
-const PI_COMMAND_NAMES = new Set(["pi", "pi-bolt"]);
+/** Interactive shells. A pane with only these is idle, not a live subagent. */
+const KNOWN_SHELLS = new Set(["bash", "zsh", "sh", "dash", "fish", "tcsh", "csh", "ksh"]);
 
 /** Basename of argv[0], e.g. `/usr/bin/pi --session x` → `pi`. */
 export function commandBasename(command: string): string {
   const argv0 = command.trim().split(/\s+/)[0] ?? "";
   return argv0.split("/").pop() ?? "";
+}
+
+/** True when the command line names a known interactive shell. */
+function isKnownShell(command: string): boolean {
+  return KNOWN_SHELLS.has(commandBasename(command).replace(/^-/, ""));
 }
 
 interface ProcessRow {
@@ -475,22 +480,28 @@ export function descendantCommands(rootPid: number): string[] {
   return commands;
 }
 
-export interface LivenessOptions {
-  /** Command matcher. Tests replace it to stand in for a pi process. */
-  isPiCommand?: (command: string) => boolean;
+/** Probe result: liveness plus the pane's dead flag. */
+export interface SurfaceLiveness {
+  /** True when some descendant is not a known shell. */
+  alive: boolean;
+  /** True when tmux reports the pane dead (remain-on-exit). */
+  paneDead: boolean;
+}
+
+/** True when any command line is not a known shell. */
+export function hasNonShellCommand(commands: string[]): boolean {
+  return commands.some((command) => !isKnownShell(command));
 }
 
 /**
- * True when the pane exists and still hosts a pi process.
+ * True when the pane exists and hosts a non-shell process.
  *
- * The pane check alone is not enough: a pane whose pi crashed, or whose launch
- * script ran to completion, returns to its interactive shell and stays open.
- * Such a row would never leave the running list.
+ * Any non-shell descendant counts as live, so pi under node, npx, or a renamed
+ * binary is still seen. A pane with only shells, or with no processes, is not
+ * alive. The pane dead flag is reported separately so the reaper can tell a
+ * dead pane from a pane idling at a shell prompt.
  */
-export function isSurfaceAlive(surface: string, options: LivenessOptions = {}): boolean {
-  const isPiCommand =
-    options.isPiCommand ?? ((command: string) => PI_COMMAND_NAMES.has(commandBasename(command)));
-
+export function isSurfaceAlive(surface: string): SurfaceLiveness {
   let pid = "";
   let dead = "1";
   try {
@@ -501,13 +512,15 @@ export function isSurfaceAlive(surface: string, options: LivenessOptions = {}): 
     );
     [pid, dead] = stdout.trim().split(/\s+/);
   } catch {
-    return false; // pane gone — nothing can be alive there
+    return { alive: false, paneDead: true }; // pane gone
   }
-  if (dead !== "0") return false; // remain-on-exit keeps the corpse visible
 
+  const paneDead = dead === "1";
   const rootPid = Number.parseInt(pid ?? "", 10);
-  if (!Number.isFinite(rootPid) || rootPid <= 0) return false;
-  return descendantCommands(rootPid).some(isPiCommand);
+  if (!Number.isFinite(rootPid) || rootPid <= 0) {
+    return { alive: false, paneDead };
+  }
+  return { alive: hasNonShellCommand(descendantCommands(rootPid)), paneDead };
 }
 
 const SHELL_READY_POLL_MS = 100;

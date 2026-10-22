@@ -38,7 +38,7 @@ import {
   NO_MODEL_SKIP_REASON,
   type TestEnv,
 } from "./harness.ts";
-import { isSurfaceAlive } from "../../pi-extension/subagents/tmux.ts";
+import { isSurfaceAlive, hasNonShellCommand } from "../../pi-extension/subagents/tmux.ts";
 import * as subagentsModule from "../../pi-extension/subagents/index.ts";
 
 const backends = getAvailableBackends();
@@ -351,7 +351,7 @@ const muxSkip: false | string =
 describe("subagent lifecycle control [tmux]", { timeout: PI_TIMEOUT, skip: muxSkip }, () => {
   const testApi = (subagentsModule as any).__test__;
   const running = testApi.runningSubagents as Map<string, any>;
-  const { REAP_GRACE_MS, REAP_INTERVAL_MS, shouldReapSubagent, reapDeadSubagents } = testApi;
+  const { REAP_GRACE_MS, REAP_INTERVAL_MS, REAP_DEAD_TICKS, shouldReapSubagent, reapDeadSubagents } = testApi;
   const { handleSubagentStop, replaceRunningByName } = testApi;
 
   let env: TestEnv;
@@ -383,16 +383,23 @@ describe("subagent lifecycle control [tmux]", { timeout: PI_TIMEOUT, skip: muxSk
     };
   }
 
-  it("reaps a pane with no live pi process after the grace window", async () => {
+  it("reaps a pane with no live process after three dead ticks", async () => {
     const surface = createTrackedSurface(env, `reap-dead-${uniqueId()}`);
     await sleep(600);
-    assert.equal(isSurfaceAlive(surface), false, "a bare shell pane holds no pi process");
+    // A minimal shell avoids prompt tools like starship, which are non-shell children.
+    execFileSync("tmux", ["respawn-pane", "-k", "-t", surface, "bash --norc --noprofile"], {
+      encoding: "utf8",
+    });
+    await sleep(600);
+    assert.equal(isSurfaceAlive(surface).alive, false, "a bare shell pane holds no live process");
 
     const row = makeRow({ id: "dead-1", surface, startSentinelAt: Date.now() - REAP_GRACE_MS - 1000 });
     running.set(row.id, row);
 
-    const reaped = reapDeadSubagents(Date.now(), { showsDone: () => false });
-    assert.equal(reaped.length, 1, "the dead row should be reaped");
+    // A single dead tick must never kill. The third consecutive tick reaps.
+    assert.equal(reapDeadSubagents(Date.now(), { showsDone: () => false }).length, 0);
+    assert.equal(reapDeadSubagents(Date.now(), { showsDone: () => false }).length, 0);
+    assert.equal(reapDeadSubagents(Date.now(), { showsDone: () => false }).length, 1);
     assert.equal(running.has("dead-1"), false, "the reaped row should leave the registry");
 
     untrackSurface(env, surface);
@@ -408,13 +415,11 @@ describe("subagent lifecycle control [tmux]", { timeout: PI_TIMEOUT, skip: muxSk
     });
     await sleep(800);
 
-    // `sleep` stands in for pi: the probe only needs one live descendant.
-    const alive = (target: string) =>
-      isSurfaceAlive(target, { isPiCommand: (command) => command.startsWith("sleep") });
-    assert.equal(alive(surface), true, "the pane should report a live child");
+    // `sleep` stands in for pi: it is a non-shell child, so the pane is alive.
+    assert.equal(isSurfaceAlive(surface).alive, true, "the pane should report a live child");
 
     running.set("live-1", makeRow({ id: "live-1", surface, startSentinelAt: Date.now() - REAP_GRACE_MS - 1000 }));
-    const reaped = reapDeadSubagents(Date.now(), { alive, showsDone: () => false });
+    const reaped = reapDeadSubagents(Date.now(), { showsDone: () => false });
 
     assert.equal(reaped.length, 0, "a live pane must never be reaped");
     assert.equal(running.has("live-1"), true, "the live row should stay registered");
@@ -424,6 +429,10 @@ describe("subagent lifecycle control [tmux]", { timeout: PI_TIMEOUT, skip: muxSk
   it("spares a pane that has not printed the start sentinel", async () => {
     const surface = createTrackedSurface(env, `reap-pre-${uniqueId()}`);
     await sleep(600);
+    execFileSync("tmux", ["respawn-pane", "-k", "-t", surface, "bash --norc --noprofile"], {
+      encoding: "utf8",
+    });
+    await sleep(600);
 
     // No startSentinelAt: the launch may still be starting pi in this pane.
     running.set("pre-1", makeRow({ id: "pre-1", surface }));
@@ -431,26 +440,85 @@ describe("subagent lifecycle control [tmux]", { timeout: PI_TIMEOUT, skip: muxSk
 
     assert.equal(reaped.length, 0, "a pre-launch pane must never be reaped");
     assert.equal(running.has("pre-1"), true);
-    assert.equal(isSurfaceAlive(surface), false, "the fixture pane holds no pi process");
+    assert.equal(isSurfaceAlive(surface).alive, false, "the fixture pane holds no live process");
     assert.equal(readScreen(surface, 5) !== undefined, true, "but the pane stays open");
   });
 
   it("never reaps inside the 25s grace window", () => {
-    const dead = () => false;
     const now = Date.now();
 
     assert.equal(REAP_GRACE_MS, 25_000, "the grace window is fixed at 25s");
     assert.equal(REAP_INTERVAL_MS, 10_000, "the module tick is fixed at 10s");
-    assert.equal(shouldReapSubagent(makeRow({ surface: "%gone" }), now, dead), false);
+    assert.equal(REAP_DEAD_TICKS, 3, "the dead-tick threshold is fixed at 3");
+    assert.equal(shouldReapSubagent(makeRow({ surface: "%gone" }), now, false), false);
 
     const start = now - REAP_GRACE_MS + 1;
-    assert.equal(shouldReapSubagent(makeRow({ surface: "%gone", startSentinelAt: start }), now, dead), false);
+    assert.equal(shouldReapSubagent(makeRow({ surface: "%gone", startSentinelAt: start }), now, false), false);
 
     const past = now - REAP_GRACE_MS - 1;
-    assert.equal(shouldReapSubagent(makeRow({ surface: "%gone", startSentinelAt: past }), now, dead), true);
+    assert.equal(shouldReapSubagent(makeRow({ surface: "%gone", startSentinelAt: past }), now, false), true);
 
-    // A live probe always wins, however old the row is.
-    assert.equal(shouldReapSubagent(makeRow({ surface: "%gone", startSentinelAt: past }), now, () => true), false);
+    // A live surface always wins, however old the row is.
+    assert.equal(shouldReapSubagent(makeRow({ surface: "%gone", startSentinelAt: past }), now, true), false);
+  });
+
+  it("treats a non-shell child as alive", () => {
+    assert.equal(hasNonShellCommand(["node /opt/pi/bin.js --session x"]), true, "node stands in for pi");
+    assert.equal(hasNonShellCommand(["npx pi run --session x"]), true, "npx stands in for pi");
+  });
+
+  it("treats a renamed pi binary as alive", () => {
+    assert.equal(hasNonShellCommand(["/opt/bin/my-pi --session x"]), true, "a renamed binary is non-shell");
+  });
+
+  it("treats only-shell descendants as not alive", () => {
+    assert.equal(hasNonShellCommand(["bash /tmp/launch.sh"]), false, "bash alone is not a live subagent");
+    assert.equal(hasNonShellCommand(["zsh"]), false, "zsh alone is not a live subagent");
+  });
+
+  it("treats an empty descendant set as not alive", () => {
+    assert.equal(hasNonShellCommand([]), false, "no descendants means nothing live");
+  });
+
+  it("reaps only after three consecutive dead ticks", () => {
+    const now = Date.now();
+    const row = makeRow({ id: "tick-1", surface: "%tick", startSentinelAt: now - REAP_GRACE_MS - 1000 });
+    running.set(row.id, row);
+    const dead = () => ({ alive: false, paneDead: true });
+
+    assert.equal(reapDeadSubagents(now, { alive: dead, showsDone: () => false }).length, 0);
+    assert.equal(reapDeadSubagents(now, { alive: dead, showsDone: () => false }).length, 0);
+    assert.equal(reapDeadSubagents(now, { alive: dead, showsDone: () => false }).length, 1);
+    assert.equal(running.has("tick-1"), false, "the row leaves only on the third dead tick");
+  });
+
+  it("resets the dead-tick counter on a live tick", () => {
+    const now = Date.now();
+    const row = makeRow({ id: "tick-2", surface: "%tick", startSentinelAt: now - REAP_GRACE_MS - 1000 });
+    running.set(row.id, row);
+    const dead = () => ({ alive: false, paneDead: true });
+    const live = () => ({ alive: true, paneDead: false });
+
+    assert.equal(reapDeadSubagents(now, { alive: dead, showsDone: () => false }).length, 0);
+    assert.equal(reapDeadSubagents(now, { alive: dead, showsDone: () => false }).length, 0);
+    assert.equal(reapDeadSubagents(now, { alive: live, showsDone: () => false }).length, 0);
+    assert.equal(running.has("tick-2"), true, "the live tick keeps the row");
+    assert.equal(reapDeadSubagents(now, { alive: dead, showsDone: () => false }).length, 0);
+    assert.equal(reapDeadSubagents(now, { alive: dead, showsDone: () => false }).length, 0);
+    assert.equal(reapDeadSubagents(now, { alive: dead, showsDone: () => false }).length, 1);
+  });
+
+  it("does not reap when the pane is dead but a non-shell child exists", () => {
+    const now = Date.now();
+    const row = makeRow({ id: "pane-dead-1", surface: "%pd", startSentinelAt: now - REAP_GRACE_MS - 1000 });
+    running.set(row.id, row);
+    // pane_dead is 1, but a non-shell descendant still exists, so the pane is alive.
+    const probe = () => ({ alive: true, paneDead: true });
+
+    assert.equal(reapDeadSubagents(now, { alive: probe, showsDone: () => false }).length, 0);
+    assert.equal(reapDeadSubagents(now, { alive: probe, showsDone: () => false }).length, 0);
+    assert.equal(reapDeadSubagents(now, { alive: probe, showsDone: () => false }).length, 0);
+    assert.equal(running.has("pane-dead-1"), true, "the non-shell child keeps the row alive");
   });
 
   it("replaces an old row when an explicit name is reused", () => {
