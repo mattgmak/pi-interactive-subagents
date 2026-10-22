@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { AutocompleteItem, AutocompleteProvider } from "@earendil-works/pi-tui";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -26,6 +27,7 @@ import {
   sendCommand,
   pollForExit,
   closeSurface,
+  isSurfaceAlive,
   shellEscape,
   readScreen,
   writeLaunchScript,
@@ -109,6 +111,7 @@ const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 // the old module keep running. See https://github.com/HazAT/pi-interactive-subagents/issues/5
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
+const REAPER_INTERVAL_KEY = Symbol.for("pi-subagents/reaper-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 
 {
@@ -121,6 +124,11 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
   if (prevStatusInterval) {
     clearInterval(prevStatusInterval);
     (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+  }
+  const prevReaperInterval = (globalThis as any)[REAPER_INTERVAL_KEY];
+  if (prevReaperInterval) {
+    clearInterval(prevReaperInterval);
+    (globalThis as any)[REAPER_INTERVAL_KEY] = null;
   }
   const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
   if (prevAbort) prevAbort.abort();
@@ -171,6 +179,18 @@ const SubagentParams = Type.Object({
     Type.String({
       description:
         "Name for the tmux window created by a window-creating surface. Ignored for a pane split.",
+    }),
+  ),
+});
+
+const SubagentStopParams = Type.Object({
+  id: Type.Optional(
+    Type.String({ description: "Exact id of a running subagent. Wins over `name` when both are given." }),
+  ),
+  name: Type.Optional(
+    Type.String({
+      description:
+        "Display name of a running subagent. A name shared by several running rows stops all of them.",
     }),
   ),
 });
@@ -232,6 +252,7 @@ const SPAWNING_TOOLS = [
   "subagent",
   "subagent_message",
   "subagents_list",
+  "subagent_stop",
 ] as const;
 
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
@@ -773,7 +794,14 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /** When the proven-launch sentinel appeared. Gates the liveness reaper. */
+  startSentinelAt?: number;
+  /** Set by the stop path so the watcher stays silent about this run. */
+  stopCause?: StopCause;
 }
+
+/** Who removed a row: the orchestrator tool, an explicit-name replace, or the reaper. */
+export type StopCause = "stop" | "replace" | "reap";
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
@@ -1389,6 +1417,174 @@ function handleSubagentSteer(
   };
 }
 
+// ── Stop and liveness reaping ──
+
+/** Grace after the start sentinel before a pane without a live pi may be reaped. */
+export const REAP_GRACE_MS = 25_000;
+
+/** Module interval that probes every running pane. */
+export const REAP_INTERVAL_MS = 10_000;
+
+/** DONE sentinel. A pane that shows it is finished, and the watcher closes it. */
+const DONE_SENTINEL_RE = /__SUBAGENT_DONE_\d+__/;
+
+/** Silent watcher result for a row that was already reported by its stopper. */
+const STOPPED = "stopped";
+
+/**
+ * Remove a row for good: kill the pane, drop it from the running list, and
+ * abort its watcher. The caller reports the outcome, so the watcher stays
+ * silent for this run.
+ */
+function stopRunningSubagent(
+  running: RunningSubagent,
+  cause: StopCause,
+  kill: (surface: string) => void = closeSurface,
+): void {
+  running.stopCause = cause;
+  runningSubagents.delete(running.id);
+  try {
+    kill(running.surface);
+  } catch {
+    // Pane already gone (crash, eaten launch, manual kill).
+  }
+  running.abortController?.abort();
+  updateWidget();
+}
+
+/**
+ * Reap decision. A pane is never reaped before its start sentinel appeared and
+ * never inside the grace window, because a pane that has not printed the
+ * sentinel may still be starting pi.
+ */
+export function shouldReapSubagent(
+  running: Pick<RunningSubagent, "surface" | "startSentinelAt">,
+  now: number,
+  alive: (surface: string) => boolean = isSurfaceAlive,
+): boolean {
+  if (!running.startSentinelAt) return false;
+  if (now - running.startSentinelAt < REAP_GRACE_MS) return false;
+  return !alive(running.surface);
+}
+
+function paneShowsDone(surface: string): boolean {
+  try {
+    return DONE_SENTINEL_RE.test(readScreen(surface, 5));
+  } catch {
+    return false;
+  }
+}
+
+/** One reaper pass. Returns the rows it removed. */
+export function reapDeadSubagents(
+  now: number,
+  deps: { alive?: (surface: string) => boolean; showsDone?: (surface: string) => boolean } = {},
+): RunningSubagent[] {
+  const alive = deps.alive ?? isSurfaceAlive;
+  const showsDone = deps.showsDone ?? paneShowsDone;
+  const reaped: RunningSubagent[] = [];
+
+  for (const running of [...runningSubagents.values()]) {
+    if (!shouldReapSubagent(running, now, alive)) continue;
+    if (showsDone(running.surface)) continue;
+    stopRunningSubagent(running, "reap");
+    reaped.push(running);
+
+    const line =
+      `Subagent "${running.name}" left no live pi process. Its pane is closed and its row is gone. ` +
+      `Continue the session with subagent_message({ name: "${running.name}", message: "…" }).`;
+    latestPi?.sendMessage(
+      {
+        customType: "subagent_status",
+        content: line,
+        display: true,
+        details: { lines: [line], overflow: 0 },
+      },
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+  }
+
+  return reaped;
+}
+
+/** Interval timer for liveness reaping. */
+let reaperInterval: ReturnType<typeof setInterval> | null = null;
+
+function startReaper() {
+  if (reaperInterval) return;
+  reaperInterval = setInterval(() => {
+    if (runningSubagents.size === 0) return;
+    reapDeadSubagents(Date.now());
+  }, REAP_INTERVAL_MS);
+  (globalThis as any)[REAPER_INTERVAL_KEY] = reaperInterval;
+}
+
+/** Stop every running row that matches by exact id (wins) or by name. */
+export function handleSubagentStop(
+  params: { id?: string; name?: string },
+  kill: (surface: string) => void = closeSurface,
+) {
+  const id = params.id?.trim();
+  const name = params.name?.trim();
+  if (!id && !name) {
+    const err = "Provide `id` or `name` of the running subagent to stop.";
+    return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+  }
+
+  const rows = [...runningSubagents.values()];
+  const runningNames = [...new Set(rows.map((running) => running.name))];
+  const resumeHint =
+    "A finished session cannot be stopped. Continue it with " +
+    'subagent_message({ name: "<name>", message: "…" }).';
+
+  let targets: RunningSubagent[];
+  if (id) {
+    const row = runningSubagents.get(id);
+    if (!row) {
+      const err =
+        `No running subagent with id "${id}". ` +
+        (rows.length > 0
+          ? `Running ids: ${rows.map((running) => running.id).join(", ")}. `
+          : "No subagents are running. ") +
+        resumeHint;
+      return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+    }
+    targets = [row];
+  } else {
+    targets = rows.filter((running) => running.name === name);
+    if (targets.length === 0) {
+      const err =
+        `No running subagent named "${name}". ` +
+        (runningNames.length > 0 ? `Running: ${runningNames.join(", ")}. ` : "No subagents are running. ") +
+        resumeHint;
+      return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+    }
+  }
+
+  const stopped = targets.map((running) => ({ id: running.id, name: running.name }));
+  for (const target of targets) stopRunningSubagent(target, "stop", kill);
+
+  const text =
+    stopped
+      .map((entry) => `Stopped "${entry.name}" [${entry.id}]: pane closed and row removed.`)
+      .join("\n") +
+    "\n\nEach session is kept. Continue one with subagent_message({ name: \"<name>\", message: \"…\" }).";
+  return { content: [{ type: "text" as const, text }], details: { stopped, status: "stopped" } };
+}
+
+/**
+ * One row per name: an explicit name takes over from a live row of the same
+ * name, so the name always addresses the newest run.
+ */
+export function replaceRunningByName(
+  name: string,
+  kill: (surface: string) => void = closeSurface,
+): RunningSubagent[] {
+  const replaced = [...runningSubagents.values()].filter((running) => running.name === name);
+  for (const stale of replaced) stopRunningSubagent(stale, "replace", kill);
+  return replaced;
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -1455,6 +1651,42 @@ function resolveResumeSurface(surface: SurfacePlacement | null | undefined): str
   return resumeSurfaceTarget(surface);
 }
 
+/** Matches the only input this provider serves: `/subagent stop <partial>`. */
+const STOP_COMMAND_RE = /^\s*\/subagent\s+stop\s+(\S*)$/;
+
+/**
+ * Tab completion for live subagent names after `/subagent stop `. Every other
+ * input prefix delegates to the built-in provider, so it stays in charge.
+ */
+export function createStopAutocompleteProvider(current: AutocompleteProvider): AutocompleteProvider {
+  return {
+    async getSuggestions(lines, cursorLine, cursorCol, options) {
+      const beforeCursor = (lines[cursorLine] ?? "").slice(0, cursorCol);
+      const match = STOP_COMMAND_RE.exec(beforeCursor);
+      if (!match) {
+        return current.getSuggestions(lines, cursorLine, cursorCol, options);
+      }
+
+      const query = match[1] ?? "";
+      const names = [...new Set([...runningSubagents.values()].map((running) => running.name))]
+        .filter((name) => name.startsWith(query))
+        .sort();
+      if (names.length === 0) return null;
+
+      const items: AutocompleteItem[] = names.map((name) => ({ value: name, label: name }));
+      return { items, prefix: query };
+    },
+
+    applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+      return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+    },
+
+    shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
+      return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
+    },
+  };
+}
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -1493,6 +1725,13 @@ export const __test__ = {
   surfacePolicyKind,
   surfacePolicyViolation,
   runningSubagents,
+  shouldReapSubagent,
+  reapDeadSubagents,
+  handleSubagentStop,
+  replaceRunningByName,
+  createStopAutocompleteProvider,
+  REAP_GRACE_MS,
+  REAP_INTERVAL_MS,
   formatElapsed,
   formatTokens,
   formatContextUsage,
@@ -1917,6 +2156,9 @@ async function watchSubagent(
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
+      onStart() {
+        running.startSentinelAt ??= Date.now();
+      },
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
@@ -2023,6 +2265,19 @@ async function watchSubagent(
     } catch {}
     runningSubagents.delete(running.id);
 
+    // The stopper already removed the row and reported this run.
+    if (running.stopCause) {
+      return {
+        name,
+        task,
+        summary: `Subagent ${running.stopCause === "replace" ? "replaced" : "stopped"}.`,
+        exitCode: 1,
+        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        error: STOPPED,
+        sessionFile,
+      };
+    }
+
     if (signal.aborted) {
       return {
         name,
@@ -2050,6 +2305,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    // Tab completion for live subagent names after `/subagent stop `.
+    ctx.ui?.addAutocompleteProvider?.((current) => createStopAutocompleteProvider(current));
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
     // subagents spawned in this session aren't watched against a dead signal.
@@ -2071,6 +2328,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       clearInterval(statusInterval);
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+    }
+    if (reaperInterval) {
+      clearInterval(reaperInterval);
+      reaperInterval = null;
+      (globalThis as any)[REAPER_INTERVAL_KEY] = null;
     }
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
@@ -2242,6 +2504,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           reservedNames.add(reservedName);
         }
 
+        // One row per name: an explicit name takes over from a live row.
+        const explicitName = params.name?.trim();
+        if (explicitName) replaceRunningByName(explicitName);
+
         // Launch the subagent (creates pane, sends command). Release the name
         // reservation once it registers in runningSubagents (or launch fails) —
         // from then on uniqueRunningName tracks it via the running map.
@@ -2273,11 +2539,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Start widget refresh and status supervision when the first agent launches
         startWidgetRefresh();
         startStatusRefresh(pi);
+        startReaper();
 
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
+            if (result.error === STOPPED) return;
 
             const presentation = resolveResultPresentation(result, running.name);
 
@@ -2454,6 +2722,57 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     });
 
 
+
+  // ── subagent_stop tool ──
+  pi.registerTool({
+    name: "subagent_stop",
+    label: "Stop Subagent",
+    description:
+      "Stop running subagents and close their panes. Pass `id` (exact, wins over name) or `name`. " +
+      "A name that matches several running rows stops all of them, and the result lists each one. " +
+      "The session file is kept, so a stopped subagent resumes with subagent_message. " +
+      "A name or id that is not running is an error: a finished session cannot be stopped.",
+    promptSnippet:
+      "Stop running subagents by `id` (exact, wins) or `name` and close their panes. " +
+      "A name shared by several rows stops all of them. Unknown names error; resume finished " +
+      "sessions with subagent_message instead.",
+    parameters: SubagentStopParams,
+
+    renderCall(args, theme) {
+      const target = args.id ?? args.name ?? "(unknown)";
+      return new Text(
+        "■ " + theme.fg("toolTitle", theme.bold(target)) + theme.fg("dim", " — stop"),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const details = result.details as any;
+      const stopped = Array.isArray(details?.stopped) ? details.stopped : [];
+      if (stopped.length > 0) {
+        return new Text(
+          stopped
+            .map(
+              (entry: any) =>
+                `${theme.fg("success", "✓")} ${theme.fg("toolTitle", theme.bold(entry.name ?? "subagent"))}` +
+                theme.fg("dim", ` [${entry.id}] — stopped`),
+            )
+            .join("\n"),
+          0,
+          0,
+        );
+      }
+
+      const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+      return new Text(theme.fg("dim", text), 0, 0);
+    },
+
+    async execute(_toolCallId, params) {
+      if (!isMuxAvailable()) return muxUnavailableResult();
+      return handleSubagentStop(params);
+    },
+  });
 
   // ── subagent_message tool ──
   pi.registerTool({
@@ -2740,6 +3059,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         runningSubagents.set(id, running);
         startWidgetRefresh();
         startStatusRefresh(pi);
+        startReaper();
 
         // Fire-and-forget watcher
         const watcherAbort = new AbortController();
@@ -2748,6 +3068,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget();
+            if (result.error === STOPPED) return;
 
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
             const summary = findLastAssistantMessage(allEntries) ??
@@ -2806,19 +3127,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // /subagent command — spawn a subagent by name
+  // /subagent command — spawn a subagent by name, or stop a running one
   pi.registerCommand("subagent", {
-    description: "Spawn a subagent: /subagent <agent> <task>",
+    description: "Spawn a subagent: /subagent <agent> <task>. Stop one: /subagent stop <name>",
     handler: async (args, ctx) => {
       const trimmed = args.trim();
       if (!trimmed) {
-        ctx.ui.notify("Usage: /subagent <agent> [task]", "warning");
+        ctx.ui.notify("Usage: /subagent <agent> [task] — or /subagent stop <name>", "warning");
         return;
       }
 
       const spaceIdx = trimmed.indexOf(" ");
       const agentName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
       const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+
+      if (agentName === "stop") {
+        const result = handleSubagentStop({ name: task });
+        const text = String(result.content[0]?.text ?? "");
+        ctx.ui.notify(text, result.details?.error ? "error" : "info");
+        return;
+      }
 
       const defs = loadAgentDefaults(agentName);
       if (!defs) {

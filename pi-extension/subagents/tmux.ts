@@ -413,6 +413,103 @@ function paneIsShellSync(surface: string): boolean {
   }
 }
 
+// ── Liveness probe ──
+
+/** Processes a live subagent pane runs: the pi CLI under any of its names. */
+const PI_COMMAND_NAMES = new Set(["pi", "pi-bolt"]);
+
+/** Basename of argv[0], e.g. `/usr/bin/pi --session x` → `pi`. */
+export function commandBasename(command: string): string {
+  const argv0 = command.trim().split(/\s+/)[0] ?? "";
+  return argv0.split("/").pop() ?? "";
+}
+
+interface ProcessRow {
+  pid: number;
+  ppid: number;
+  command: string;
+}
+
+function readProcessTable(): ProcessRow[] {
+  let out = "";
+  try {
+    out = execFileSync("ps", ["-A", "-o", "pid=,ppid=,command="], { encoding: "utf8" });
+  } catch {
+    return [];
+  }
+  const rows: ProcessRow[] = [];
+  for (const line of out.split("\n")) {
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+    if (!match) continue;
+    rows.push({ pid: Number(match[1]), ppid: Number(match[2]), command: match[3] });
+  }
+  return rows;
+}
+
+/**
+ * Command lines of every descendant of `rootPid`, root included. The launch
+ * script runs pi as a child (`bash <script>` pane program), so the pane pid is
+ * never pi itself.
+ */
+export function descendantCommands(rootPid: number): string[] {
+  const children = new Map<number, ProcessRow[]>();
+  const byPid = new Map<number, ProcessRow>();
+  for (const row of readProcessTable()) {
+    byPid.set(row.pid, row);
+    const siblings = children.get(row.ppid);
+    if (siblings) siblings.push(row);
+    else children.set(row.ppid, [row]);
+  }
+
+  const commands: string[] = [];
+  const root = byPid.get(rootPid);
+  if (root) commands.push(root.command);
+  const queue = [rootPid];
+  while (queue.length > 0) {
+    const pid = queue.shift() as number;
+    for (const child of children.get(pid) ?? []) {
+      commands.push(child.command);
+      queue.push(child.pid);
+    }
+  }
+  return commands;
+}
+
+export interface LivenessOptions {
+  /** Command matcher. Tests replace it to stand in for a pi process. */
+  isPiCommand?: (command: string) => boolean;
+}
+
+/**
+ * True when the pane exists and still hosts a pi process.
+ *
+ * The pane check alone is not enough: a pane whose pi crashed, or whose launch
+ * script ran to completion, returns to its interactive shell and stays open.
+ * Such a row would never leave the running list.
+ */
+export function isSurfaceAlive(surface: string, options: LivenessOptions = {}): boolean {
+  const isPiCommand =
+    options.isPiCommand ?? ((command: string) => PI_COMMAND_NAMES.has(commandBasename(command)));
+
+  let pid = "";
+  let dead = "1";
+  try {
+    const stdout = execFileSync(
+      "tmux",
+      ["display-message", "-p", "-t", surface, "#{pane_pid} #{pane_dead}"],
+      { encoding: "utf8" },
+    );
+    [pid, dead] = stdout.trim().split(/\s+/);
+  } catch {
+    return false; // pane gone — nothing can be alive there
+  }
+  if (dead !== "0") return false; // remain-on-exit keeps the corpse visible
+
+  const rootPid = Number.parseInt(pid ?? "", 10);
+  if (!Number.isFinite(rootPid) || rootPid <= 0) return false;
+  return descendantCommands(rootPid).some(isPiCommand);
+}
+
 const SHELL_READY_POLL_MS = 100;
 
 /**
@@ -627,7 +724,7 @@ function interpretExitSidecar(data: any): PollResult {
   return { reason: "done", exitCode: 0 };
 }
 
-export const __pollForExitTest__ = { interpretExitSidecar };
+export const __pollForExitTest__ = { interpretExitSidecar, commandBasename, descendantCommands };
 
 /**
  * Poll until the subagent exits. Checks for a `.exit` sidecar file first
@@ -642,6 +739,8 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
+    /** Called once when the proven-launch sentinel appears. */
+    onStart?: () => void;
   },
 ): Promise<PollResult> {
   const start = Date.now();
@@ -708,6 +807,7 @@ export async function pollForExit(
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
       if (START_SENTINEL_RE.test(screen)) {
+        if (!seenStart) options.onStart?.();
         seenStart = true;
       }
     } catch {
