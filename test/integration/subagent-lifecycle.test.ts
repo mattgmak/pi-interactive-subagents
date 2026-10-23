@@ -737,6 +737,33 @@ describe("subagent lifecycle control [tmux]", { timeout: PI_TIMEOUT, skip: muxSk
     assert.throws(() => readScreen(surface, 5), "the stop path should close the pane");
   });
 
+  it("kills every running pane when the parent session shuts down", async () => {
+    const surface = createTrackedSurface(env, `shutdown-${uniqueId()}`);
+    await sleep(600);
+    running.set("shutdown-1", makeRow({ id: "shutdown-1", name: "Worker", surface }));
+
+    // Capture the shutdown handler the extension registers on load.
+    let onShutdown: (() => void) | undefined;
+    const pi: any = {
+      on: (event: string, handler: () => void) => {
+        if (event === "session_shutdown") onShutdown = handler;
+      },
+      registerTool: () => {},
+      registerCommand: () => {},
+      registerMessageRenderer: () => {},
+      sendMessage: () => {},
+      sendUserMessage: () => {},
+    };
+    (subagentsModule as any).default(pi);
+    assert.equal(typeof onShutdown, "function", "the extension must register a shutdown handler");
+
+    onShutdown!();
+
+    assert.equal(running.size, 0, "shutdown must empty the running registry");
+    untrackSurface(env, surface);
+    assert.throws(() => readScreen(surface, 5), "shutdown should close the pane");
+  });
+
   it("stops a running subagent by name", () => {
     const killed: string[] = [];
     running.set("a1", makeRow({ id: "a1", name: "Scout", surface: "%a" }));

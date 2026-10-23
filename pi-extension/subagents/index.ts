@@ -803,8 +803,11 @@ interface RunningSubagent {
   stopCause?: StopCause;
 }
 
-/** Who removed a row: the orchestrator tool, an explicit-name replace, or the reaper. */
-export type StopCause = "stop" | "replace" | "reap";
+/**
+ * Who removed a row: the orchestrator tool, an explicit-name replace, the
+ * reaper, or the parent session shutting down.
+ */
+export type StopCause = "stop" | "replace" | "reap" | "shutdown";
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
@@ -2366,8 +2369,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
-    for (const [_id, agent] of runningSubagents) {
-      agent.abortController?.abort();
+    // Kill every child pane with the parent. Session files stay on disk, so a
+    // stopped subagent still resumes with subagent_message.
+    for (const running of [...runningSubagents.values()]) {
+      stopRunningSubagent(running, "shutdown");
     }
     runningSubagents.clear();
   });
