@@ -14,7 +14,8 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/test.ts",
-    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
+    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts",
+    "test:e2e": "node --test --test-name-pattern 'reaps a real subagent|stops a real subagent' test/integration/subagent-lifecycle.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

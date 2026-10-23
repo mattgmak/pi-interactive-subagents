@@ -40,7 +40,7 @@ import {
 } from "./harness.ts";
 
 /** Per-attempt budget for the LLM suite. A slow model spends it once per attempt. */
-const LLM_ATTEMPT_TIMEOUT = Number(process.env.PI_TEST_LLM_TIMEOUT ?? "45000");
+const LLM_ATTEMPT_TIMEOUT = Number(process.env.PI_TEST_LLM_TIMEOUT ?? "30000");
 
 /** Runner budget covers two attempts, so a timeout retries instead of cancelling the case. */
 const LLM_SUITE_TIMEOUT = LLM_ATTEMPT_TIMEOUT * 2 + 20_000;
@@ -109,7 +109,7 @@ async function waitForSubagentPi(token: string, timeout: number): Promise<Subage
   while (Date.now() < deadline) {
     const found = findSubagentPi(token);
     if (found) return found;
-    await sleep(120);
+    await sleep(50);
   }
   return null;
 }
@@ -452,7 +452,6 @@ for (const backend of backends) {
       mark(surface);
       const token = env.dir.split("/").pop() ?? env.dir;
       widenPane(surface);
-      await sleep(1000);
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
@@ -488,7 +487,6 @@ for (const backend of backends) {
       mark(surface);
       const token = env.dir.split("/").pop() ?? env.dir;
       widenPane(surface);
-      await sleep(1000);
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
