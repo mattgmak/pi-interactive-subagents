@@ -247,7 +247,11 @@ export function startPi(
   opts?: { model?: string; extraArgs?: string },
 ): void {
   const model = opts?.model ?? TEST_MODEL;
-  const extra = opts?.extraArgs ?? "";
+  // `-ne` disables auto-discovery, so a provider extension the model needs must be
+  // passed explicitly. Tests set PI_TEST_EXTRA_ARGS to add such a flag.
+  const extra = [opts?.extraArgs ?? "", process.env.PI_TEST_EXTRA_ARGS?.trim() ?? ""]
+    .filter(Boolean)
+    .join(" ");
 
   // Force pi to load the working-tree extension (not an installed pi-package
   // snapshot). `-ne` disables extension auto-discovery, `-e <path>` loads the

@@ -38,6 +38,111 @@ import {
   NO_MODEL_SKIP_REASON,
   type TestEnv,
 } from "./harness.ts";
+
+/** Per-attempt budget for the LLM suite. A slow model spends it once per attempt. */
+const LLM_ATTEMPT_TIMEOUT = Number(process.env.PI_TEST_LLM_TIMEOUT ?? "45000");
+
+/** Runner budget covers two attempts, so a timeout retries instead of cancelling the case. */
+const LLM_SUITE_TIMEOUT = LLM_ATTEMPT_TIMEOUT * 2 + 20_000;
+
+/** Retry a case once on timeout. An assertion failure stays a failure. */
+async function itRetry(name: string, fn: (mark: (surface: string) => void) => Promise<void>) {
+  it(name, async () => {
+    const attempt = async () => {
+      let marked = "";
+      const mark = (surface: string) => {
+        marked = surface;
+      };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          const context = marked ? diagnostics(marked) : "";
+          reject(new Error(`attempt timed out after ${LLM_ATTEMPT_TIMEOUT}ms${context}`));
+        }, LLM_ATTEMPT_TIMEOUT);
+      });
+      try {
+        await Promise.race([fn(mark), timeout]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+
+    try {
+      await attempt();
+    } catch (error) {
+      const message = String((error as Error)?.message ?? error);
+      if (!/timed out|timeout/i.test(message)) throw error;
+      console.warn(`[retry] ${name} hit a timeout, retrying once`);
+      await attempt();
+    }
+  });
+}
+
+type SubagentProcess = { piPid: number; command: string };
+
+/** `stat` lets a caller skip zombies, whose cmdline survives until the parent reaps them. */
+function psLines(): string[] {
+  const out = execFileSync("ps", ["-Ao", "pid=,stat=,command="], { encoding: "utf8" });
+  return out.split("\n").filter(Boolean);
+}
+
+function splitPsLine(line: string): { pid: number; stat: string; command: string } {
+  const match = line.trim().match(/^(\d+)\s+(\S+)\s+(.*)$/);
+  return { pid: Number(match?.[1] ?? 0), stat: match?.[2] ?? "", command: match?.[3] ?? "" };
+}
+
+/** Every process whose cmdline names this test env, launcher wrapper or pi child. */
+function subagentProcesses(token: string): SubagentProcess[] {
+  return psLines()
+    .map(splitPsLine)
+    .filter((entry) => entry.command.includes(token) && !entry.stat.startsWith("Z"))
+    .map((entry) => ({ piPid: entry.pid, command: entry.command }));
+}
+
+/** The pi process of a launched subagent: it carries a --session flag. */
+function findSubagentPi(token: string): SubagentProcess | null {
+  return subagentProcesses(token).find((entry) => entry.command.includes("--session ")) ?? null;
+}
+
+async function waitForSubagentPi(token: string, timeout: number): Promise<SubagentProcess | null> {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const found = findSubagentPi(token);
+    if (found) return found;
+    await sleep(120);
+  }
+  return null;
+}
+
+async function waitForNoSubagentPi(token: string, timeout: number): Promise<void> {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (findSubagentPi(token) === null) return;
+    await sleep(500);
+  }
+  throw new Error(`a subagent pi process survived for ${timeout}ms`);
+}
+
+/** A narrow pane wraps output, which hides text from the screen reader. */
+function widenPane(surface: string): void {
+  try {
+    execFileSync("tmux", ["resize-pane", "-t", surface, "-x", "200", "-y", "50"], { encoding: "utf8" });
+  } catch {}
+}
+
+/** Attach the outer screen tail and live subagent processes to a failure. */
+function diagnostics(surface: string): string {
+  let screen = "";
+  try {
+    screen = readScreen(surface, 150);
+  } catch (error) {
+    screen = `<no screen: ${String(error)}>`;
+  }
+  const procs = psLines()
+    .filter((line) => line.includes("subagent-scripts"))
+    .map((line) => line.trim().slice(0, 140))
+    .join(" ;; ");  return `\n--- subagent processes: ${procs || "none"}\n--- outer screen tail:\n${screen.slice(-2500)}`;
+}
 import { isSurfaceAlive, hasNonShellCommand } from "../../pi-extension/subagents/tmux.ts";
 import * as subagentsModule from "../../pi-extension/subagents/index.ts";
 
@@ -56,7 +161,7 @@ if (TEST_MODEL === null) {
 const modelSkip: false | string = TEST_MODEL === null ? NO_MODEL_SKIP_REASON : false;
 
 for (const backend of backends) {
-  describe(`subagent-lifecycle [${backend}]`, { timeout: PI_TIMEOUT * 3, skip: modelSkip }, () => {
+  describe(`subagent-lifecycle [${backend}]`, { timeout: LLM_SUITE_TIMEOUT, skip: modelSkip }, () => {
     let env: TestEnv;
 
     before(() => {
@@ -69,7 +174,7 @@ for (const backend of backends) {
 
     // ── Basic spawn + completion ──
 
-    it("spawns a subagent that writes a file and verifies the session", async () => {
+    itRetry("spawns a subagent that writes a file and verifies the session", async () => {
       const id = uniqueId();
       const markerFile = `/tmp/pi-integ-echo-${id}.txt`;
       trackTempFile(env, markerFile);
@@ -89,7 +194,7 @@ for (const backend of backends) {
       startPi(surface, env.dir, task);
 
       // Verify: subagent created the marker file
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /PASS/);
+      const content = await waitForFile(markerFile, LLM_ATTEMPT_TIMEOUT, /PASS/);
       assert.ok(
         content.includes(`PASS_${id}`),
         `Marker file should contain PASS_${id}. Got: ${content.trim()}`,
@@ -99,7 +204,7 @@ for (const backend of backends) {
       const screen = await waitForScreen(
         surface,
         /INTEGRATION_COMPLETE|completed|Sub-agent.*"Echo/i,
-        PI_TIMEOUT,
+        LLM_ATTEMPT_TIMEOUT,
       );
 
       // Verify: session file was created (shown in steer result)
@@ -119,7 +224,7 @@ for (const backend of backends) {
 
     // ── In-progress activity snapshots ──
 
-    it("keeps a long active tool call from surfacing false stalled status", async () => {
+    itRetry("keeps a long active tool call from surfacing false stalled status", async () => {
       const id = uniqueId();
       const startFile = `/tmp/pi-integ-status-start-${id}.txt`;
       const markerFile = `/tmp/pi-integ-status-${id}.txt`;
@@ -140,23 +245,23 @@ for (const backend of backends) {
 
       startPi(surface, env.dir, task);
 
-      const activeScreen = await waitForScreen(surface, /active[\s\S]*bash|bash[\s\S]*active/i, PI_TIMEOUT, 300);
+      const activeScreen = await waitForScreen(surface, /active[\s\S]*bash|bash[\s\S]*active/i, LLM_ATTEMPT_TIMEOUT, 300);
       assert.doesNotMatch(activeScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
 
-      await waitForFile(startFile, PI_TIMEOUT, /START_/);
+      await waitForFile(startFile, LLM_ATTEMPT_TIMEOUT, /START_/);
       assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the long sleep");
       await sleep(65_000);
       assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the watchdog assertion");
       const watchdogScreen = readScreen(surface, 300);
       assert.doesNotMatch(watchdogScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
 
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /STATUS_/);
+      const content = await waitForFile(markerFile, LLM_ATTEMPT_TIMEOUT, /STATUS_/);
       assert.ok(content.includes(`STATUS_${id}`), `Marker file should contain STATUS_${id}`);
 
       const completionScreen = await waitForScreen(
         surface,
         /STATUS_TEST_DONE|completed|Sub-agent.*"Status-/i,
-        PI_TIMEOUT,
+        LLM_ATTEMPT_TIMEOUT,
         300,
       );
       assert.ok(/STATUS_TEST_DONE|completed/i.test(completionScreen));
@@ -164,7 +269,7 @@ for (const backend of backends) {
 
     // ── Parallel subagent spawn ──
 
-    it("spawns two subagents in parallel and both complete", async () => {
+    itRetry("spawns two subagents in parallel and both complete", async () => {
       const id = uniqueId();
       const fileA = `/tmp/pi-integ-para-${id}-a.txt`;
       const fileB = `/tmp/pi-integ-para-${id}-b.txt`;
@@ -194,8 +299,8 @@ for (const backend of backends) {
 
       // Both marker files should appear
       const [contentA, contentB] = await Promise.all([
-        waitForFile(fileA, PI_TIMEOUT, /DONE_A/),
-        waitForFile(fileB, PI_TIMEOUT, /DONE_B/),
+        waitForFile(fileA, LLM_ATTEMPT_TIMEOUT, /DONE_A/),
+        waitForFile(fileB, LLM_ATTEMPT_TIMEOUT, /DONE_B/),
       ]);
 
       assert.ok(contentA.includes(`DONE_A_${id}`), `File A should contain marker`);
@@ -204,7 +309,7 @@ for (const backend of backends) {
 
     // ── Fork mode ──
 
-    it("fork mode creates a child session linked to the parent", async () => {
+    itRetry("fork mode creates a child session linked to the parent", async () => {
       const id = uniqueId();
       const markerFile = `/tmp/pi-integ-fork-${id}.txt`;
       trackTempFile(env, markerFile);
@@ -224,14 +329,14 @@ for (const backend of backends) {
       startPi(surface, env.dir, task);
 
       // Verify: forked subagent created the file
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /FORK_OK/);
+      const content = await waitForFile(markerFile, LLM_ATTEMPT_TIMEOUT, /FORK_OK/);
       assert.ok(content.includes(`FORK_OK_${id}`), `Fork marker file should exist with content`);
 
       // Wait for the outer pi to show the result
       const screen = await waitForScreen(
         surface,
         /FORK_COMPLETE|completed|Sub-agent.*"Fork/i,
-        PI_TIMEOUT,
+        LLM_ATTEMPT_TIMEOUT,
       );
 
       // Verify: the forked session has a parent link
@@ -254,7 +359,7 @@ for (const backend of backends) {
 
     // ── caller_ping ──
 
-    it("subagent caller_ping sends notification back to the parent", async () => {
+    itRetry("subagent caller_ping sends notification back to the parent", async () => {
       const id = uniqueId();
 
       const surface = createTrackedSurface(env, `ping-${id}`);
@@ -275,7 +380,7 @@ for (const backend of backends) {
       const screen = await waitForScreen(
         surface,
         /needs help|PING|caller_ping|ping/i,
-        PI_TIMEOUT,
+        LLM_ATTEMPT_TIMEOUT,
       );
 
       assert.ok(
@@ -286,7 +391,7 @@ for (const backend of backends) {
 
     // ── Agent discovery ──
 
-    it("subagent discovers project-local test agents", async () => {
+    itRetry("subagent discovers project-local test agents", async () => {
       const id = uniqueId();
       const markerFile = `/tmp/pi-integ-discovery-${id}.txt`;
       trackTempFile(env, markerFile);
@@ -308,13 +413,13 @@ for (const backend of backends) {
       startPi(surface, env.dir, task);
 
       // The test-echo agent (discovered from project .pi/agents/) should work
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /DISCO/);
+      const content = await waitForFile(markerFile, LLM_ATTEMPT_TIMEOUT, /DISCO/);
       assert.ok(content.includes(`DISCO_${id}`), `Discovery test marker should exist`);
     });
 
     // ── Subagent with custom system prompt ──
 
-    it("passes systemPrompt to subagent", async () => {
+    itRetry("passes systemPrompt to subagent", async () => {
       const id = uniqueId();
       const markerFile = `/tmp/pi-integ-sysprompt-${id}.txt`;
       trackTempFile(env, markerFile);
@@ -333,8 +438,85 @@ for (const backend of backends) {
 
       startPi(surface, env.dir, task);
 
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /SYSPROMPT/);
+      const content = await waitForFile(markerFile, LLM_ATTEMPT_TIMEOUT, /SYSPROMPT/);
       assert.ok(content.includes(`SYSPROMPT_${id}`), `System prompt test marker should exist`);
+    });
+
+    // ── Reaper end to end: kill the pi child of a real subagent ──
+
+    itRetry("reaps a real subagent whose pi process is killed", async (mark) => {
+      const id = uniqueId();
+      const name = `Reap-${id}`;
+
+      const surface = createTrackedSurface(env, `reap-e2e-${id}`);
+      mark(surface);
+      const token = env.dir.split("/").pop() ?? env.dir;
+      widenPane(surface);
+      await sleep(1000);
+
+      const task = [
+        `Call the subagent tool with these EXACT parameters:`,
+        `  name: "${name}"`,
+        `  agent: "test-echo"`,
+        `  task: "Run: sleep 300"`,
+        `Do not wait for it to finish. Just make the call once.`,
+      ].join("\n");
+
+      startPi(surface, env.dir, task);
+
+      try {
+        const pi = await waitForSubagentPi(token, LLM_ATTEMPT_TIMEOUT);
+        assert.ok(pi, `a subagent pi process should run for ${name}`);
+
+        // Standing in for an external kill: SIGKILL the subagent pi, then let the reaper act.
+        process.kill(pi.piPid, "SIGKILL");
+
+        await waitForNoSubagentPi(token, LLM_ATTEMPT_TIMEOUT);
+        assert.equal(findSubagentPi(token), null, "the reaper should end the subagent");
+      } catch (error) {
+        throw new Error(`${(error as Error).message}${diagnostics(surface)}`);
+      }
+    });
+
+    // ── Stop end to end: the parent stops a real subagent ──
+
+    itRetry("stops a real subagent through the subagent_stop tool", async (mark) => {
+      const id = uniqueId();
+      const name = `Stop-${id}`;
+
+      const surface = createTrackedSurface(env, `stop-e2e-${id}`);
+      mark(surface);
+      const token = env.dir.split("/").pop() ?? env.dir;
+      widenPane(surface);
+      await sleep(1000);
+
+      const task = [
+        `Call the subagent tool with these EXACT parameters:`,
+        `  name: "${name}"`,
+        `  agent: "test-echo"`,
+        `  task: "Run: sleep 300"`,
+        `The call returns as soon as the subagent starts.`,
+        `Then call the subagent_stop tool with name: "${name}" in the same turn.`,
+        `After it returns, say STOP_E2E_DONE.`,
+      ].join("\n");
+
+      startPi(surface, env.dir, task);
+
+      try {
+        const pi = await waitForSubagentPi(token, LLM_ATTEMPT_TIMEOUT);
+        assert.ok(pi, `a subagent pi process should run for ${name}`);
+        console.warn(`[step] subagent pi ${pi.piPid} up for ${name}`);
+
+        // The stop tool reports a confirmation and the parent then ends its turn.
+        const screen = await waitForScreen(surface, /stopped|STOP_E2E_DONE/i, LLM_ATTEMPT_TIMEOUT, 200);
+        console.warn(`[step] stop confirmation seen for ${name}`);
+        assert.match(screen, /stopped|STOP_E2E_DONE/i, "the parent should confirm the stop");
+
+        await waitForNoSubagentPi(token, LLM_ATTEMPT_TIMEOUT);
+        assert.equal(findSubagentPi(token), null, "the stop path should end the pi process");
+      } catch (error) {
+        throw new Error(`${(error as Error).message}${diagnostics(surface)}`);
+      }
     });
   });
 }
