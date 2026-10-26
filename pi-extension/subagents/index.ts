@@ -3078,6 +3078,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const running: RunningSubagent = {
           id,
           name,
+          // Resumed rows need the agent type or the widget drops the (agent) tag.
+          ...(loadout.agent ? { agent: loadout.agent } : {}),
           task: message,
           surface: placement.pane,
           placement,
