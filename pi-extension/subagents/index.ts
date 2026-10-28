@@ -1043,12 +1043,13 @@ function getProviderExtensionPath(model: string): string | undefined {
 const SUBAGENT_BASE_EXTENSIONS = [
   "pi-lean-ctx",
   "pi-permission-system",
+  "filter-output",
   "pi-cursor-sdk",
-  "pi-clinepass-provider",
   "pi-web-access",
   "pi-powerline-footer",
   "pi-caveman",
   "pi-codegraph",
+  "rpiv-todo",
   "pi-token-speed",
   "agent-ste",
 ] as const;
