@@ -1050,6 +1050,7 @@ const SUBAGENT_BASE_EXTENSIONS = [
   "pi-caveman",
   "pi-codegraph",
   "pi-token-speed",
+  "agent-ste",
 ] as const;
 
 /** Resolve a pi loader dir under PI_CODING_AGENT_DIR/extensions/<name>/index.ts. */
