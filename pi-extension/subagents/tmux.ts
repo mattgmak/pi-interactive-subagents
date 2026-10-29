@@ -704,6 +704,11 @@ const DONE_SENTINEL_RE = /__SUBAGENT_DONE_(\d+)__/;
 /** Proven-launch sentinel printed as the first line of the launch script. */
 const START_SENTINEL_RE = /__SUBAGENT_START__/;
 /**
+ * Lines scanned for the DONE sentinel. The sentinel scrolls out of a 5-line
+ * window once the pane falls back to an interactive shell, so read deep.
+ */
+export const SENTINEL_SCAN_LINES = 200;
+/**
  * Window in which an eaten launch is detected: the start sentinel must appear
  * within this many ms of polling, or — if the pane is just sitting at an idle
  * shell prompt — the launch is declared eaten and the pane is killed.
@@ -782,6 +787,12 @@ export async function pollForExit(
     onTick?: (elapsed: number) => void;
     /** Called once when the proven-launch sentinel appears. */
     onStart?: () => void;
+    /**
+     * Fast-path finish probe, checked before the screen read. The caller reads
+     * the child's activity file, which stays correct after the sentinel scrolls
+     * away.
+     */
+    isFinished?: () => boolean;
   },
 ): Promise<PollResult> {
   const start = Date.now();
@@ -804,6 +815,12 @@ export async function pollForExit(
         }
       } catch {}
     }
+
+    try {
+      if (options.isFinished?.()) {
+        return { reason: "done", exitCode: 0 };
+      }
+    } catch {}
 
     // Check Claude sentinel file (written by plugin Stop hook)
     if (options.sentinelFile) {
@@ -842,7 +859,7 @@ export async function pollForExit(
     // proven-launch detection). DONE marks a finished subagent; START marks
     // that the launch script actually ran.
     try {
-      const screen = await readScreenAsync(surface, 5);
+      const screen = await readScreenAsync(surface, SENTINEL_SCAN_LINES);
       const match = screen.match(DONE_SENTINEL_RE);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };

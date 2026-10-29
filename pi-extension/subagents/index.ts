@@ -32,6 +32,7 @@ import {
   shellEscape,
   readScreen,
   writeLaunchScript,
+  SENTINEL_SCAN_LINES,
 } from "./tmux.ts";
 
 // Activate the worktree's direnv/devenv environment inside the launch script
@@ -716,7 +717,7 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "reaped"
   >,
   name: string,
 ): string {
@@ -738,9 +739,13 @@ function resolveResultPresentation(
     );
   }
 
-  return result.exitCode !== 0
+  const base = result.exitCode !== 0
     ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
     : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+
+  return result.reaped
+    ? `${base}\n\nThe reaper found no live pi process in its pane; this result came from the session file.`
+    : base;
 }
 
 /**
@@ -759,6 +764,8 @@ interface SubagentResult {
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
+  /** True when the reaper marked the row finished before the pane showed the sentinel. */
+  reaped?: boolean;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
 }
@@ -801,6 +808,11 @@ interface RunningSubagent {
   deadTicks?: number;
   /** Set by the stop path so the watcher stays silent about this run. */
   stopCause?: StopCause;
+  /**
+   * Set by the reaper when the pane lost its pi process. The row stays in the
+   * map so the watcher can still report the result from the session file.
+   */
+  reaped?: boolean;
 }
 
 /**
@@ -1494,6 +1506,11 @@ const DONE_SENTINEL_RE = /__SUBAGENT_DONE_\d+__/;
 /** Silent watcher result for a row that was already reported by its stopper. */
 const STOPPED = "stopped";
 
+/** Every skip and every dropped area writes one line here, so a lost result is visible. */
+function logSubagent(message: string): void {
+  console.error("[pi-subagents] " + message);
+}
+
 /**
  * Remove a row for good: kill the pane, drop it from the running list, and
  * abort its watcher. The caller reports the outcome, so the watcher stays
@@ -1533,13 +1550,21 @@ export function shouldReapSubagent(
 
 function paneShowsDone(surface: string): boolean {
   try {
-    return DONE_SENTINEL_RE.test(readScreen(surface, 5));
+    return DONE_SENTINEL_RE.test(readScreen(surface, SENTINEL_SCAN_LINES));
   } catch {
     return false;
   }
 }
 
-/** One reaper pass. Returns the rows it removed. */
+/**
+ * Mark a dead row finished without removing it. The row and its watcher stay
+ * alive so the watcher can report the result it reads from the session file.
+ */
+function requestFinish(running: RunningSubagent): void {
+  running.reaped = true;
+}
+
+/** One reaper pass. Returns the rows it marked finished. */
 export function reapDeadSubagents(
   now: number,
   deps: {
@@ -1552,6 +1577,7 @@ export function reapDeadSubagents(
   const reaped: RunningSubagent[] = [];
 
   for (const running of [...runningSubagents.values()]) {
+    if (running.reaped === true) continue;
     if (!running.startSentinelAt) {
       running.deadTicks = 0;
       continue;
@@ -1574,20 +1600,14 @@ export function reapDeadSubagents(
     running.deadTicks = (running.deadTicks ?? 0) + 1;
     if (running.deadTicks < REAP_DEAD_TICKS) continue;
 
-    stopRunningSubagent(running, "reap");
+    requestFinish(running);
     reaped.push(running);
 
-    const line =
-      `Subagent "${running.name}" left no live pi process. Its pane is closed and its row is gone. ` +
-      `Continue the session with subagent_message({ name: "${running.name}", message: "…" }).`;
-    latestPi?.sendMessage(
-      {
-        customType: "subagent_status",
-        content: line,
-        display: true,
-        details: { lines: [line], overflow: 0 },
-      },
-      { triggerTurn: true, deliverAs: "steer" },
+    logSubagent(
+      `subagent "${running.name}" lost its pi process ` +
+        `(surface ${running.surface}, ${running.deadTicks} dead ticks, no ${DONE_SENTINEL_RE.source} ` +
+        `in the last ${SENTINEL_SCAN_LINES} screen lines); marked finished, result pending from ` +
+        `${running.sessionFile}. Its session is kept.`,
     );
   }
 
@@ -1820,6 +1840,9 @@ export const __test__ = {
   countLiveSubagents,
   shouldReapSubagent,
   reapDeadSubagents,
+  requestFinish,
+  paneShowsDone,
+  SENTINEL_SCAN_LINES,
   handleSubagentStop,
   replaceRunningByName,
   createStopAutocompleteProvider,
@@ -2239,6 +2262,42 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   );
 }
 
+/**
+ * Wait for the pane to lose its process. The pane close that follows must not
+ * cut off the sentinel that the launch script wrote.
+ */
+async function waitForSurfaceGone(surface: string, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if (!isSurfaceAlive(surface).alive) return;
+    } catch {
+      return;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/**
+ * A finished child leaves the DONE sentinel in scrollback, not always on the
+ * visible screen. Read its activity file instead: phase done plus a terminal
+ * event means the pi process ended, whatever the pane shows.
+ */
+function activityShowsFinished(running: RunningSubagent): boolean {
+  if (running.reaped === true) return true;
+  const file = running.activityFile;
+  if (!file) return false;
+  try {
+    const activity = JSON.parse(readFileSync(file, "utf-8"));
+    return (
+      activity?.phase === "done" &&
+      (activity.latestEvent === "agent_end" || activity.latestEvent === "session_shutdown")
+    );
+  } catch {
+    return false;
+  }
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -2257,7 +2316,15 @@ async function watchSubagent(
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
       },
+      isFinished: () => activityShowsFinished(running),
     });
+
+    const reaped = running.reaped === true;
+    if (reaped || activityShowsFinished(running)) {
+      if (result.reason !== "timeout" && result.reason !== "eaten") {
+        await waitForSurfaceGone(surface);
+      }
+    }
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
@@ -2306,26 +2373,37 @@ async function watchSubagent(
       }
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}), ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}) };
+      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(reaped ? { reaped } : {}), ...(sessionId ? { claudeSessionId: sessionId } : {}), ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}) };
     }
 
     // Pi subagent result extraction
     let summary: string;
+    let noOutput = false;
     if (existsSync(sessionFile)) {
       const allEntries = getNewEntries(sessionFile, 0);
+      const last = findLastAssistantMessage(allEntries);
+      noOutput = last == null && !result.errorMessage && result.exitCode === 0;
       summary =
-        findLastAssistantMessage(allEntries) ??
+        last ??
         (result.errorMessage
           ? `Subagent error: ${result.errorMessage}`
           : result.exitCode !== 0
             ? `Sub-agent exited with code ${result.exitCode}`
             : "Sub-agent exited without output");
     } else {
+      noOutput = !result.errorMessage && result.exitCode === 0;
       summary = result.errorMessage
         ? `Subagent error: ${result.errorMessage}`
         : result.exitCode !== 0
           ? `Sub-agent exited with code ${result.exitCode}`
           : "Sub-agent exited without output";
+    }
+
+    if (noOutput) {
+      logSubagent(
+        `subagent "${name}" finished with no assistant output ` +
+          `(reason ${result.reason}, exit ${result.exitCode}); session ${sessionFile}`,
+      );
     }
 
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
@@ -2350,6 +2428,7 @@ async function watchSubagent(
       ...(subagentSessionId ? { sessionId: subagentSessionId } : {}),
       exitCode: result.exitCode,
       elapsed,
+      ...(reaped ? { reaped } : {}),
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       ...(stats ? { stats } : {}),
     };
@@ -2641,7 +2720,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
-            if (result.error === STOPPED) return;
+            if (result.error === STOPPED) {
+              logSubagent(
+                `subagent "${running.name}" was stopped before it reported ` +
+                  `(session ${running.sessionFile}); no result was sent.`,
+              );
+              return;
+            }
 
             const presentation = resolveResultPresentation(result, running.name);
 
@@ -2668,6 +2753,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           })
           .catch((err) => {
             updateWidget();
+            logSubagent(
+              `subagent "${running.name}" failed in its watcher ` +
+                `(${err?.message ?? String(err)}); session ${running.sessionFile}`,
+            );
             pi.sendMessage(
               {
                 customType: "subagent_result",

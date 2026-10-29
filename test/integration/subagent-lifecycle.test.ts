@@ -531,7 +531,7 @@ const muxSkip: false | string =
 describe("subagent lifecycle control [tmux]", { timeout: PI_TIMEOUT, skip: muxSkip }, () => {
   const testApi = (subagentsModule as any).__test__;
   const running = testApi.runningSubagents as Map<string, any>;
-  const { REAP_GRACE_MS, REAP_INTERVAL_MS, REAP_DEAD_TICKS, shouldReapSubagent, reapDeadSubagents } = testApi;
+  const { REAP_GRACE_MS, REAP_INTERVAL_MS, REAP_DEAD_TICKS, shouldReapSubagent, reapDeadSubagents, paneShowsDone } = testApi;
   const { handleSubagentStop, replaceRunningByName } = testApi;
 
   let env: TestEnv;
@@ -563,7 +563,7 @@ describe("subagent lifecycle control [tmux]", { timeout: PI_TIMEOUT, skip: muxSk
     };
   }
 
-  it("reaps a pane with no live process after three dead ticks", async () => {
+  it("marks a pane with no live process finished after three dead ticks", async () => {
     const surface = createTrackedSurface(env, `reap-dead-${uniqueId()}`);
     await sleep(600);
     // A minimal shell avoids prompt tools like starship, which are non-shell children.
@@ -573,17 +573,60 @@ describe("subagent lifecycle control [tmux]", { timeout: PI_TIMEOUT, skip: muxSk
     await sleep(600);
     assert.equal(isSurfaceAlive(surface).alive, false, "a bare shell pane holds no live process");
 
-    const row = makeRow({ id: "dead-1", surface, startSentinelAt: Date.now() - REAP_GRACE_MS - 1000 });
+    const controller = new AbortController();
+    const row = makeRow({
+      id: "dead-1",
+      surface,
+      startSentinelAt: Date.now() - REAP_GRACE_MS - 1000,
+      abortController: controller,
+    });
     running.set(row.id, row);
 
-    // A single dead tick must never kill. The third consecutive tick reaps.
+    // A single dead tick must never act. The third consecutive tick marks it done.
     assert.equal(reapDeadSubagents(Date.now(), { showsDone: () => false }).length, 0);
     assert.equal(reapDeadSubagents(Date.now(), { showsDone: () => false }).length, 0);
     assert.equal(reapDeadSubagents(Date.now(), { showsDone: () => false }).length, 1);
-    assert.equal(running.has("dead-1"), false, "the reaped row should leave the registry");
+    assert.equal(row.reaped, true, "the row is marked finished");
+    assert.equal(running.has("dead-1"), true, "the row stays so its watcher can report the result");
+    assert.equal(controller.signal.aborted, false, "the watcher must keep running");
 
     untrackSurface(env, surface);
-    assert.throws(() => readScreen(surface, 5), "the reaper should kill the pane");
+    assert.equal(readScreen(surface, 5) !== undefined, true, "the reaper must not kill the pane");
+  });
+
+  it("does not reap a row twice", () => {
+    const now = Date.now();
+    const row = makeRow({ id: "twice-1", surface: "%twice", startSentinelAt: now - REAP_GRACE_MS - 1000 });
+    running.set(row.id, row);
+    const dead = () => ({ alive: false, paneDead: true });
+
+    assert.equal(reapDeadSubagents(now, { alive: dead, showsDone: () => false }).length, 0);
+    assert.equal(reapDeadSubagents(now, { alive: dead, showsDone: () => false }).length, 0);
+    assert.equal(reapDeadSubagents(now, { alive: dead, showsDone: () => false }).length, 1);
+    assert.equal(reapDeadSubagents(now, { alive: dead, showsDone: () => false }).length, 0);
+    assert.equal(running.has("twice-1"), true);
+  });
+
+  it("finds the DONE sentinel above the shallow capture window", async () => {
+    const surface = createTrackedSurface(env, `deep-${uniqueId()}`);
+    await sleep(500);
+    // `-S -5` starts five lines above the visible top and runs to the pane
+    // bottom, so the shallow window holds pane_height + 5 lines.
+    const height = Number.parseInt(
+      execFileSync("tmux", ["display", "-p", "-t", surface, "#{pane_height}"], { encoding: "utf8" }).trim(),
+      10,
+    );
+    const fillerCount = height + 20;
+    const script =
+      `echo __SUBAGENT_DONE_0__; for i in $(seq 1 ${fillerCount}); do echo filler $i; done; sleep 60`;
+    execFileSync("tmux", ["respawn-pane", "-k", "-t", surface, `bash --norc --noprofile -c '${script}'`], {
+      encoding: "utf8",
+    });
+    await sleep(1200);
+
+    assert.doesNotMatch(readScreen(surface, 5), /__SUBAGENT_DONE_0__/, "the sentinel is outside the shallow window");
+    assert.equal(paneShowsDone(surface), true, "the deep scan finds the sentinel");
+    untrackSurface(env, surface);
   });
 
   it("spares a pane that still hosts a live child process", async () => {
@@ -660,7 +703,7 @@ describe("subagent lifecycle control [tmux]", { timeout: PI_TIMEOUT, skip: muxSk
     assert.equal(hasNonShellCommand([]), false, "no descendants means nothing live");
   });
 
-  it("reaps only after three consecutive dead ticks", () => {
+  it("marks the row done only after three consecutive dead ticks", () => {
     const now = Date.now();
     const row = makeRow({ id: "tick-1", surface: "%tick", startSentinelAt: now - REAP_GRACE_MS - 1000 });
     running.set(row.id, row);
@@ -669,7 +712,8 @@ describe("subagent lifecycle control [tmux]", { timeout: PI_TIMEOUT, skip: muxSk
     assert.equal(reapDeadSubagents(now, { alive: dead, showsDone: () => false }).length, 0);
     assert.equal(reapDeadSubagents(now, { alive: dead, showsDone: () => false }).length, 0);
     assert.equal(reapDeadSubagents(now, { alive: dead, showsDone: () => false }).length, 1);
-    assert.equal(running.has("tick-1"), false, "the row leaves only on the third dead tick");
+    assert.equal(row.reaped, true, "the row is marked done on the third dead tick");
+    assert.equal(running.has("tick-1"), true, "the row leaves only when its watcher reports");
   });
 
   it("resets the dead-tick counter on a live tick", () => {
