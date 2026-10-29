@@ -841,6 +841,24 @@ const RUNNING_COUNT_CHANNEL = "agent-sesh:subagents-running:v1";
 let lastRunningCount: { running: number; stalled: number } | null = null;
 
 /**
+ * Count live children. A child whose activity phase is done keeps its map entry
+ * until the reaper runs, so it must not count as live. A child with no activity
+ * file stays live: the map alone governs its liveness.
+ */
+export function countLiveSubagents(
+  children: Iterable<Pick<RunningSubagent, "activity" | "statusState">>,
+): { running: number; stalled: number } {
+  let running = 0;
+  let stalled = 0;
+  for (const child of children) {
+    if (child.activity?.phase === "done") continue;
+    running += 1;
+    if (child.statusState.currentKind === "stalled") stalled += 1;
+  }
+  return { running, stalled };
+}
+
+/**
  * Publish the live child count. The bus is absent on older harnesses, so probe
  * it and stay silent instead of throwing.
  */
@@ -849,24 +867,20 @@ function emitRunningCount(): void {
   const bus = pi?.events;
   if (!pi || !bus || typeof bus.emit !== "function") return;
 
-  let stalled = 0;
-  for (const running of runningSubagents.values()) {
-    if (running.statusState.currentKind === "stalled") stalled += 1;
-  }
-  const runningCount = runningSubagents.size;
+  const { running, stalled } = countLiveSubagents(runningSubagents.values());
 
   if (
     lastRunningCount &&
-    lastRunningCount.running === runningCount &&
+    lastRunningCount.running === running &&
     lastRunningCount.stalled === stalled
   ) {
     return;
   }
-  lastRunningCount = { running: runningCount, stalled };
+  lastRunningCount = { running, stalled };
 
   bus.emit(RUNNING_COUNT_CHANNEL, {
     parentSessionId: latestCtx?.sessionManager.getSessionId() ?? "",
-    running: runningCount,
+    running,
     stalled,
   });
 }
@@ -1800,6 +1814,7 @@ export const __test__ = {
   surfacePolicyKind,
   surfacePolicyViolation,
   runningSubagents,
+  countLiveSubagents,
   shouldReapSubagent,
   reapDeadSubagents,
   handleSubagentStop,

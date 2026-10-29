@@ -3568,3 +3568,33 @@ describe("tmux.ts", () => {
     });
   });
 });
+
+describe("countLiveSubagents", () => {
+  const { countLiveSubagents } = subagentsModule;
+
+  const child = (phase?: "starting" | "active" | "waiting" | "done", kind = "active") =>
+    ({ activity: phase ? { phase } : undefined, statusState: { currentKind: kind } }) as any;
+
+  it("counts a child with no activity file", () => {
+    assert.deepEqual(countLiveSubagents([child()]), { running: 1, stalled: 0 });
+  });
+
+  it("skips a child whose activity phase is done", () => {
+    assert.deepEqual(countLiveSubagents([child("done")]), { running: 0, stalled: 0 });
+  });
+
+  it("counts every phase except done", () => {
+    for (const phase of ["starting", "active", "waiting"] as const) {
+      assert.deepEqual(countLiveSubagents([child(phase)]), { running: 1, stalled: 0 });
+    }
+  });
+
+  it("keeps the stalled sub-count among live children only", () => {
+    const counts = countLiveSubagents([
+      child("active", "stalled"),
+      child("waiting", "stalled"),
+      child("done", "stalled"),
+    ]);
+    assert.deepEqual(counts, { running: 2, stalled: 2 });
+  });
+});
