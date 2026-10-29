@@ -65,6 +65,29 @@ function requireTmux(): void {
   }
 }
 
+// ── tmux invocation ──
+
+/**
+ * Run tmux with its stderr piped, never inherited.
+ *
+ * An inherited stderr sends tmux text (for example `can't find pane: %12`)
+ * straight to pi's TUI terminal. Piped stderr keeps the terminal clean, so the
+ * text moves into the thrown error message. The message stays readable at call
+ * sites that show `error.message`.
+ */
+function runTmux(args: string[]): string {
+  try {
+    return execFileSync("tmux", args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error: any) {
+    const stderr = String(error?.stderr ?? "").trim();
+    if (!stderr) throw error;
+    throw new Error(stderr);
+  }
+}
+
 // ── Shell helpers ──
 
 export function shellEscape(s: string): string {
@@ -99,9 +122,7 @@ function rebalanceSurfaces(hintPane?: string): void {
     rebalanceTimer = null;
     try {
       // -t <pane> resolves to that pane's window; does not change focus.
-      execFileSync("tmux", ["select-layout", "-t", target, SUBAGENT_TMUX_LAYOUT], {
-        encoding: "utf8",
-      });
+      runTmux(["select-layout", "-t", target, SUBAGENT_TMUX_LAYOUT]);
     } catch {
       // Pane/window may be gone; balancing is best-effort.
     }
@@ -155,7 +176,7 @@ export function createSurfaceSplit(
     args.push(opts.command);
   }
 
-  const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
+  const pane = runTmux(args).trim();
   if (!pane.startsWith("%")) {
     throw new Error(`Unexpected tmux split-window output: ${pane}`);
   }
@@ -246,11 +267,7 @@ export interface SurfacePlacement {
 /** Name of the tmux session hosting a pane, or null if unreachable. */
 export function sessionNameFor(surface: string): string | null {
   try {
-    const name = execFileSync(
-      "tmux",
-      ["display-message", "-p", "-t", surface, "#{session_name}"],
-      { encoding: "utf8" },
-    ).trim();
+    const name = runTmux(["display-message", "-p", "-t", surface, "#{session_name}"]).trim();
     return name || null;
   } catch {
     return null;
@@ -338,7 +355,7 @@ export function launchSurfaceAt(
     target.kind === "new-session" ? tmuxSessionExists(target.session!) : true,
     windowName,
   );
-  const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
+  const pane = runTmux(args).trim();
   if (!pane.startsWith("%")) {
     throw new Error(`Unexpected tmux placement output: ${pane}`);
   }
@@ -402,11 +419,13 @@ async function paneIsIdleShell(surface: string): Promise<boolean> {
  */
 function paneIsShellSync(surface: string): boolean {
   try {
-    const cmd = execFileSync(
-      "tmux",
-      ["display-message", "-p", "-t", surface, "#{pane_current_command}"],
-      { encoding: "utf8" },
-    ).trim();
+    const cmd = runTmux([
+      "display-message",
+      "-p",
+      "-t",
+      surface,
+      "#{pane_current_command}",
+    ]).trim();
     return INTERACTIVE_SHELLS.has(cmd);
   } catch {
     return false;
@@ -499,21 +518,26 @@ export function hasNonShellCommand(commands: string[]): boolean {
  * Any non-shell descendant counts as live, so pi under node, npx, or a renamed
  * binary is still seen. A pane with only shells, or with no processes, is not
  * alive. The pane dead flag is reported separately so the reaper can tell a
- * dead pane from a pane idling at a shell prompt.
+ * dead pane from a pane idling at a shell prompt. A pane id that no longer
+ * exists reports `paneDead: true`.
  */
 export function isSurfaceAlive(surface: string): SurfaceLiveness {
   let pid = "";
   let dead = "1";
   try {
-    const stdout = execFileSync(
-      "tmux",
-      ["display-message", "-p", "-t", surface, "#{pane_pid} #{pane_dead}"],
-      { encoding: "utf8" },
-    );
+    const stdout = runTmux([
+      "display-message",
+      "-p",
+      "-t",
+      surface,
+      "#{pane_pid} #{pane_dead}",
+    ]);
     [pid, dead] = stdout.trim().split(/\s+/);
   } catch {
     return { alive: false, paneDead: true }; // pane gone
   }
+  // tmux prints nothing and exits 0 for a stale pane id.
+  if (!pid) return { alive: false, paneDead: true };
 
   const paneDead = dead === "1";
   const rootPid = Number.parseInt(pid ?? "", 10);
@@ -560,12 +584,19 @@ export async function waitForShellReady(surface: string, timeoutMs: number): Pro
  */
 export function sendCommand(surface: string, command: string, flush = false): void {
   requireTmux();
-  if (flush && paneIsShellSync(surface)) {
-    execFileSync("tmux", ["send-keys", "-t", surface, "C-c"], { encoding: "utf8" });
-    execFileSync("tmux", ["send-keys", "-t", surface, "C-u"], { encoding: "utf8" });
+  // One tmux probe per typed command (not per keystroke): a stale pane id
+  // throws here with a clear text instead of a bare tmux send-keys error.
+  // `paneDead` alone marks an unusable pane; a live pane idling at a shell
+  // prompt reports `alive: false` and stays a valid target.
+  if (isSurfaceAlive(surface).paneDead) {
+    throw new Error(`subagent pane ${surface} is gone`);
   }
-  execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
-  execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
+  if (flush && paneIsShellSync(surface)) {
+    runTmux(["send-keys", "-t", surface, "C-c"]);
+    runTmux(["send-keys", "-t", surface, "C-u"]);
+  }
+  runTmux(["send-keys", "-t", surface, "-l", command]);
+  runTmux(["send-keys", "-t", surface, "Enter"]);
 }
 
 /**
@@ -638,13 +669,7 @@ export function sendLongCommand(
  */
 export function readScreen(surface: string, lines = 50): string {
   requireTmux();
-  return execFileSync(
-    "tmux",
-    ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
-    {
-      encoding: "utf8",
-    },
-  );
+  return runTmux(["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`]);
 }
 
 /**
@@ -665,7 +690,7 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  */
 export function closeSurface(surface: string): void {
   requireTmux();
-  execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+  runTmux(["kill-pane", "-t", surface]);
   rebalanceSurfaces();
 }
 
@@ -850,7 +875,7 @@ export async function pollForExit(
             `init (no __SUBAGENT_START__ seen and pane idle at shell prompt); killing pane.`,
         );
         try {
-          execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+          runTmux(["kill-pane", "-t", surface]);
         } catch {
           // Pane may already be gone; ignore.
         }
