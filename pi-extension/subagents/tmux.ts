@@ -457,7 +457,10 @@ interface ProcessRow {
 function readProcessTable(): ProcessRow[] {
   let out = "";
   try {
-    out = execFileSync("ps", ["-A", "-o", "pid=,ppid=,command="], { encoding: "utf8" });
+    out = execFileSync("ps", ["-A", "-o", "pid=,ppid=,command="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
   } catch {
     return [];
   }
