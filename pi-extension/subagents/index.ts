@@ -1682,6 +1682,9 @@ function startStatusRefresh(pi: ExtensionAPI) {
         statusInterval = null;
         (globalThis as any)[STATUS_INTERVAL_KEY] = null;
       }
+      // No later tick runs. A count seeded while a child ran stays above zero
+      // without this publish.
+      emitRunningCount();
       return;
     }
 
