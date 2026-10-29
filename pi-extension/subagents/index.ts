@@ -834,6 +834,43 @@ let widgetInterval: ReturnType<typeof setInterval> | null = null;
 /** Interval timer for status transition checks. */
 let statusInterval: ReturnType<typeof setInterval> | null = null;
 
+/** Fixed channel contract for sibling extensions that render the live count. */
+const RUNNING_COUNT_CHANNEL = "agent-sesh:subagents-running:v1";
+
+/** Last payload sent on the bus, so an unchanged count stays quiet. */
+let lastRunningCount: { running: number; stalled: number } | null = null;
+
+/**
+ * Publish the live child count. The bus is absent on older harnesses, so probe
+ * it and stay silent instead of throwing.
+ */
+function emitRunningCount(): void {
+  const pi = latestPi;
+  const bus = pi?.events;
+  if (!pi || !bus || typeof bus.emit !== "function") return;
+
+  let stalled = 0;
+  for (const running of runningSubagents.values()) {
+    if (running.statusState.currentKind === "stalled") stalled += 1;
+  }
+  const runningCount = runningSubagents.size;
+
+  if (
+    lastRunningCount &&
+    lastRunningCount.running === runningCount &&
+    lastRunningCount.stalled === stalled
+  ) {
+    return;
+  }
+  lastRunningCount = { running: runningCount, stalled };
+
+  bus.emit(RUNNING_COUNT_CHANNEL, {
+    parentSessionId: latestCtx?.sessionManager.getSessionId() ?? "",
+    running: runningCount,
+    stalled,
+  });
+}
+
 function formatElapsedMMSS(startTime: number): string {
   const seconds = Math.floor((Date.now() - startTime) / 1000);
   const m = Math.floor(seconds / 60);
@@ -1462,6 +1499,7 @@ function stopRunningSubagent(
   }
   running.abortController?.abort();
   updateWidget();
+  emitRunningCount();
 }
 
 /**
@@ -1668,6 +1706,8 @@ function startStatusRefresh(pi: ExtensionAPI) {
         { triggerTurn: true, deliverAs: "steer" },
       );
     }
+
+    emitRunningCount();
   }, 1000);
 
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
