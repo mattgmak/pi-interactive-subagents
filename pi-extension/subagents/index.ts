@@ -1086,6 +1086,7 @@ const PROVIDER_EXTENSION_LOADERS: Record<string, string> = {
   opencode: "pi-opencode-provider",
   "opencode-go": "pi-opencode-provider",
   commandcode: "pi-commandcode-provider",
+  balance: "pi-balance",
 };
 
 /** Provider extensions are not tool-backed; load explicitly for --no-extensions children. */
