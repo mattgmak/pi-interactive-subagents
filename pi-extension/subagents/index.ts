@@ -1083,11 +1083,13 @@ function formatSandboxModel(model: string, thinking: string | null | undefined):
 
 const PROVIDER_EXTENSION_LOADERS: Record<string, string> = {
   cursor: "pi-cursor-sdk",
-  opencode: "pi-opencode-provider",
-  "opencode-go": "pi-opencode-provider",
   commandcode: "pi-commandcode-provider",
   balance: "pi-balance",
 };
+
+// `balance` routes to physical models behind these providers, so a `balance`
+// child needs their loaders too. `--no-extensions` hides them otherwise.
+const BALANCE_ROUTE_LOADERS = ["pi-commandcode-provider", "pi-clinepass-provider"] as const;
 
 /** Provider extensions are not tool-backed; load explicitly for --no-extensions children. */
 function getProviderExtensionPath(model: string): string | undefined {
@@ -1250,6 +1252,12 @@ function collectSubagentExtensionPaths(loadout: SubagentLoadout): Set<string> {
   if (loadout.model) {
     const providerExtPath = getProviderExtensionPath(loadout.model);
     if (providerExtPath) extPaths.add(providerExtPath);
+    if (loadout.model.split("/")[0] === "balance") {
+      for (const name of BALANCE_ROUTE_LOADERS) {
+        const extPath = getCuratedExtensionPath(name);
+        if (extPath) extPaths.add(extPath);
+      }
+    }
   }
 
   return extPaths;
