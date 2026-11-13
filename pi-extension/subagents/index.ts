@@ -1118,6 +1118,7 @@ const SUBAGENT_BASE_EXTENSIONS = [
   "rpiv-todo",
   "pi-token-speed",
   "agent-ste",
+  "pi-vim",
 ] as const;
 
 /** Resolve a pi loader dir under PI_CODING_AGENT_DIR/extensions/<name>/index.ts. */
