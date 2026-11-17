@@ -1119,6 +1119,7 @@ const SUBAGENT_BASE_EXTENSIONS = [
   "pi-token-speed",
   "agent-ste",
   "pi-vim",
+  "shell-wait-guard",
 ] as const;
 
 /** Resolve a pi loader dir under PI_CODING_AGENT_DIR/extensions/<name>/index.ts. */
